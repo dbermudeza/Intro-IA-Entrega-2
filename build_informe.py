@@ -17,7 +17,7 @@ D = sys.argv[1] if len(sys.argv) > 1 else "salidas"
 OUT_PDF = sys.argv[2] if len(sys.argv) > 2 else "Documento_diseno.pdf"
 
 # ======================= EDITAR ANTES DE ENTREGAR =======================
-INTEGRANTES = ["Integrante 1", "Integrante 2", "Integrante 3", "Integrante 4"]
+INTEGRANTES = ["Juan José Jiménez Maya", "Thomas Tamayo Durango", "Daniel Bermudez Aranguren", "Juan David Giraldo"]
 VIDEO_URL = "https://youtu.be/PENDIENTE"
 DATASET_URL = "https://www.kaggle.com/datasets/rohanrao/air-quality-data-in-india"
 # ========================================================================
