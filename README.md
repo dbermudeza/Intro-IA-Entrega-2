@@ -1,12 +1,10 @@
-# Práctica 2 – Calidad del aire en India
+# Práctica 2 – Calidad del aire en India (Grupo 01 · Equipo 10)
 
-| Archivo | Qué es |
+| Archivo | Contenido |
 |---|---|
-| `practica2.ipynb` | **Notebook para Colab** (entregable de código). |
-| `build_informe.py` | Genera el PDF de diseño desde `salidas/` (cifras automáticas). |
+| `practica2.ipynb` | Notebook (Google Colab) con la implementación supervisada y no supervisada, ya ejecutado. |
+| `build_informe.py` | Genera el informe Word (`Informe_Practica2.docx`) a partir de `salidas/`. |
+| `salidas/` | Tablas, figuras y resúmenes exportados por el notebook. |
+| `entrega/` | Entregables finales: informe Word |
 
-## Flujo para la entrega
-1. Colab → subir `city_day.csv` (o dejar que `kagglehub` lo descargue) → *Entorno → Ejecutar todo*. Descarga `salidas.zip`.
-2. Descomprimir `salidas.zip` junto a `build_informe.py`; poner nombres y enlace del video; `python build_informe.py`.
-   Si la consola imprime **"REVISAR TEXTO"**, alguna frase del análisis ya no coincide con los nuevos números: ajústenla.
-3. ZIP final `practica2-grupo-01-equipo-10.zip` con el notebook, el PDF y el enlace al dataset original.
+Regenerar el informe: `python build_informe.py salidas Informe_Practica2.docx` (requiere pandas, numpy, matplotlib, python-docx, pillow).

@@ -1,24 +1,52 @@
-"""Genera el documento de diseño (PDF) a partir de lo que exporta el notebook en salidas/.
+"""Genera el documento de diseño de la Práctica 2 en formato Word (.docx) a partir de lo que exporta el notebook en salidas/.
 
-Uso:  python build_informe.py [carpeta_salidas] [pdf_salida]
-Los números salen de salidas/*.csv|json; el texto cualitativo se escribió con la corrida de referencia y
-`verificar()` avisa por consola si alguna afirmación dejó de cumplirse tras cambiar la cédula (revisen esas frases).
-Requiere: pandas, matplotlib y Chromium/Chrome (para imprimir el HTML a PDF).
+Uso:
+    python build_informe.py [carpeta_salidas] [informe.docx] [--pdf]
+
+* Todas las cifras salen de salidas/*.csv|json (los mismos archivos que escribe la última celda del notebook).
+* El texto interpretativo se redactó con la corrida de referencia (cédula en salidas/resumen.json). Cada afirmación cualitativa
+  se comprueba con `chequear()`: si tras cambiar la cédula alguna ya no se cumple, la consola imprime «REVISAR TEXTO».
+* El contenido se define una sola vez como una lista de bloques (`B`) y se dibuja con `render_docx()`.
+* `--pdf` convierte además el .docx a PDF con LibreOffice (opcional; también se puede exportar desde Word o Google Docs).
+Requiere: pandas, numpy, matplotlib, python-docx.
 """
-import glob, json, os, re, subprocess, sys
+import json, os, re, shutil, subprocess, sys, tempfile
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
+from docx import Document
+from docx.enum.section import WD_ORIENT, WD_SECTION
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt, RGBColor
 
-D = sys.argv[1] if len(sys.argv) > 1 else "salidas"
-OUT_PDF = sys.argv[2] if len(sys.argv) > 2 else "Documento_diseno.pdf"
+# ----------------------------------------------------------------------------------------------------------------------
+# Parámetros
+# ----------------------------------------------------------------------------------------------------------------------
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_salidas():
+    for p in ([args[0]] if args else []) + ["salidas", os.path.join(HERE, "salidas"), os.path.join(HERE, "..", "salidas"),
+                                           os.path.join(HERE, "..", "..", "salidas")]:
+        if os.path.exists(os.path.join(p, "resumen.json")):
+            return os.path.abspath(p)
+    sys.exit("No encuentro la carpeta salidas/ (debe contener resumen.json). Pásela como primer argumento.")
+
+
+D = _find_salidas()
+OUT_DOCX = os.path.abspath(args[1] if len(args) > 1 else "Informe_Practica2.docx")
+WORK = tempfile.mkdtemp(prefix="informe_")           # diagramas generados aquí; no se ensucia salidas/
 
 # ======================= EDITAR ANTES DE ENTREGAR =======================
 INTEGRANTES = ["Juan José Jiménez Maya", "Thomas Tamayo Durango", "Daniel Bermudez Aranguren", "Juan David Giraldo"]
-VIDEO_URL = "https://youtu.be/PENDIENTE"
+VIDEO_URL = ""        # pegar aquí el enlace de YouTube cuando el video esté subido; vacío = se deja un marcador resaltado
 DATASET_URL = "https://www.kaggle.com/datasets/rohanrao/air-quality-data-in-india"
 # ========================================================================
 
@@ -31,70 +59,134 @@ MODELOS = ["Árboles", "KNN", "SVM", "Redes Neuronales"]
 CLASES = ["Good", "Satisfactory", "Moderate", "Poor", "Very Poor", "Severe"]
 CASOS = {i + 1: dict(ED=(i >= 4), OUT=(i % 4 >= 2), BAL=(i % 2 == 1)) for i in range(8)}
 SI = lambda b: "SI" if b else "NO"
+fmt = lambda x, n=3: f"{x:.{n}f}"
+sg = lambda x: "≈ 0" if abs(x) < 0.0005 else f"{x:+.3f}"
+pct = lambda x, n=0: f"{100 * x:.{n}f} %"
 
-P = {m: R.pivot(index="caso", columns="modelo", values=m) for m in ["f1", "accuracy", "precision", "recall"]}
+P = {m: R.pivot(index="caso", columns="modelo", values=m)[MODELOS] for m in ["f1", "accuracy", "precision", "recall"]}
 f1 = P["f1"]
-R["ED"] = R.caso.map(lambda c: SI(CASOS[c]["ED"])); R["OUT"] = R.caso.map(lambda c: SI(CASOS[c]["OUT"])); R["BAL"] = R.caso.map(lambda c: SI(CASOS[c]["BAL"]))
+for k, key in [("ED", "ED"), ("OUT", "OUT"), ("BAL", "BAL")]:
+    R[k] = R.caso.map(lambda c, key=key: SI(CASOS[c][key]))
 
 
 def efecto(factor):
-    """F1 medio con el factor en SI menos NO, por modelo."""
+    """F1 medio con el factor en SI y en NO, y su diferencia (SI - NO), por modelo."""
     t = R.groupby(["modelo", factor]).f1.mean().unstack().reindex(MODELOS)
     return t["NO"], t["SI"], t["SI"] - t["NO"]
 
 
 ef = {k: efecto(k) for k in ["ED", "OUT", "BAL"]}
-fmt = lambda x, n=3: f"{x:.{n}f}"
-sg = lambda x: "≈ 0" if abs(x) < 0.0005 else f"{x:+.3f}"
-
-# ---------------------------- verificación de afirmaciones ----------------------------
-def verificar():
-    avisos = []
-    if not all(np.allclose(f1.loc[i, "Árboles"], f1.loc[i + 4, "Árboles"]) for i in range(1, 5)):
-        avisos.append("El árbol ya NO es idéntico con y sin escalado (casos i vs i+4).")
-    if not all(ef["BAL"][2][m] > 0 for m in MODELOS):
-        avisos.append("El balanceo ya no mejora el F1 medio en los 4 modelos.")
-    if not (ef["ED"][2]["SVM"] > 0 and ef["ED"][2]["Redes Neuronales"] > 0):
-        avisos.append("El escalado ya no mejora SVM y redes.")
-    if any(abs(ef["OUT"][2][m]) > 0.03 for m in MODELOS):
-        avisos.append("El efecto de los outliers superó 0.03 de F1 en algún modelo (el texto dice que es pequeño).")
-    if f1["Árboles"].max() < max(f1[m].max() for m in MODELOS):
-        avisos.append("El árbol ya no tiene el F1 máximo general.")
-    if not (F3["K óptimo (silhouette)"] == 2).all():
-        avisos.append("K-Means ya no elige K=2 en los 8 casos.")
-    if not (F3.loc[F3.Balanceo == "NO", "DB clusters"] == 1).all():
-        avisos.append("DBSCAN ya no da 1 cluster en los casos desbalanceados.")
-    if J["roc_caso8"]["Árboles"]["auc_macro"] > min(J["roc_caso8"][m]["auc_macro"] for m in ["SVM", "Redes Neuronales"]):
-        avisos.append("El árbol ya no tiene el AUC más bajo entre árbol, SVM y redes en el caso 8.")
-    print("VERIFICACIÓN:", "todo coincide con el texto." if not avisos else "")
-    for a in avisos:
-        print("  - REVISAR TEXTO:", a)
+ED_, OUT_, BAL_ = (ef[k][2] for k in ["ED", "OUT", "BAL"])
+roc = J["roc_caso8"]
+casos_tr = J["casos"]
+nul = J["nulos_pct"]
+mx = {m: (f1[m].max(), int(f1[m].idxmax())) for m in MODELOS}
+ranking = sorted(mx.items(), key=lambda kv: -kv[1][0])
+c8 = f1.loc[8]
+n_feat = casos_tr["1"]["n_features"]
+n_train_unb, n_train_bal = casos_tr["1"]["n_train"], casos_tr["2"]["n_train"]
+ultimo_dig = (J["n_registros"] - 5000) // 150
+dist = J["dist_subconjunto"]
+n_test = J["tamanos_split"]["te"]
+arbol = J["arbol"]
+knn_k = J["knn_k"]
+nn_ep = J["nn_epocas"]
+k_bal = [knn_k[str(c)] for c in range(1, 9) if CASOS[c]["BAL"]]
+k_unb = [knn_k[str(c)] for c in range(1, 9) if not CASOS[c]["BAL"]]
 
 
-verificar()
+def rep(m):
+    return pd.read_csv(f"{D}/reporte_clases_caso8_{m.replace(' ', '_')}.csv", index_col=0)
 
-# ---------------------------- diagrama del pipeline ----------------------------
+
+def cmat(m):
+    return pd.read_csv(f"{D}/matriz_confusion_caso8_{m.replace(' ', '_')}.csv", index_col=0)
+
+
+sev = {m: rep(m).loc["Severe", "recall"] for m in MODELOS}
+poor_f1 = {m: rep(m).loc["Poor", "f1-score"] for m in MODELOS}
+tot_test = cmat("SVM").values.sum()
+adj = {}
+for m in MODELOS:
+    cm = cmat(m).values
+    err = cm.sum() - np.trace(cm)
+    adj[m] = sum(cm[i, j] for i in range(6) for j in range(6) if abs(i - j) == 1) / err
+mod_share = cmat("SVM").loc["Moderate"].sum() / tot_test      # proporción de Moderate en el test
+
+AVISOS = []
+
+
+def chequear(cond, msg):
+    """Registra una advertencia si una afirmación del texto deja de cumplirse con los datos actuales."""
+    if not cond:
+        AVISOS.append(msg)
+    return cond
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Verificación de las afirmaciones cualitativas
+# ----------------------------------------------------------------------------------------------------------------------
+chequear(all(np.allclose(f1.loc[i, "Árboles"], f1.loc[i + 4, "Árboles"]) for i in range(1, 5)), "El árbol ya NO es idéntico con y sin escalado.")
+chequear(all(BAL_[m] > 0 for m in MODELOS), "El balanceo ya no mejora el F1 medio en los 4 modelos.")
+chequear(all(abs(BAL_[m]) > max(abs(ED_[m]), abs(OUT_[m])) for m in MODELOS), "El balanceo ya no es la decisión de mayor efecto en los 4 modelos.")
+chequear(ED_["SVM"] > 0 and ED_["Redes Neuronales"] > 0, "El escalado ya no mejora SVM y redes.")
+chequear(ED_["KNN"] < 0, "El escalado ya no empeora KNN en promedio.")
+chequear(all(abs(OUT_[m]) < 0.02 for m in MODELOS), "El efecto medio de los outliers superó 0.02 de F1 en algún modelo.")
+chequear(ranking[0][0] in ("Redes Neuronales", "SVM"), "El mejor F1 máximo ya no es de red o SVM.")
+chequear(max(c8[["SVM", "Redes Neuronales"]]) > max(c8[["Árboles", "KNN"]]), "En el caso 8 SVM/red ya no superan a árbol y KNN.")
+chequear(all(np.isclose(f1.loc[c, "Redes Neuronales"], f1.loc[1, "Redes Neuronales"]) for c in (1, 3)) and f1.loc[1, "Redes Neuronales"] < 0.1,
+         "La red ya no colapsa en los casos 1 y 3.")
+chequear(np.isclose(P["accuracy"].loc[1, "Redes Neuronales"], mod_share, atol=2e-3), "La exactitud de la red en el caso 1 ya no coincide con la proporción de Moderate.")
+chequear(all(k == 1 for k in k_bal) and all(k > 1 for k in k_unb), "KNN ya no elige k=1 exactamente en los casos balanceados.")
+chequear(roc["SVM"]["auc_macro"] > roc["Árboles"]["auc_macro"] and roc["Redes Neuronales"]["auc_macro"] > roc["Árboles"]["auc_macro"], "El AUC de SVM/red ya no supera al del árbol.")
+chequear(roc["KNN"]["auc_macro"] == min(v["auc_macro"] for v in roc.values()), "KNN ya no tiene el AUC ROC más bajo.")
+chequear(roc["KNN"]["auc_pr_micro"] > roc["Árboles"]["auc_pr_micro"], "El AUC-PR de KNN ya no supera al del árbol.")
+chequear(all(v > 0.85 for v in adj.values()), "Ya no es cierto que casi todos los errores sean entre clases vecinas.")
+chequear((F3["K óptimo (silhouette)"] == 2).all(), "K-Means ya no elige K=2 en los 8 casos.")
+db_unb = F3[F3.Balanceo == "NO"]
+db_bal = F3[F3.Balanceo == "SI"]
+chequear((db_unb["DB clusters"] == 1).sum() == 3 and db_unb.loc[db_unb["#"] == 3, "DB clusters"].iloc[0] == 2, "DBSCAN ya no da 1 cluster en los casos desbalanceados 1, 5 y 7 (y 2 en el 3).")
+chequear((db_bal["DB clusters"] >= 5).all(), "DBSCAN ya no encuentra ≥ 5 clusters en todos los casos balanceados.")
+chequear(F3[F3.ED == "NO"]["KM silhouette"].mean() > F3[F3.ED == "SI"]["KM silhouette"].mean(), "El silhouette sin escalar ya no es mayor que con escalado.")
+chequear(F3[F3.Balanceo == "SI"]["KM silhouette"].mean() > F3[F3.Balanceo == "NO"]["KM silhouette"].mean(), "El silhouette balanceado ya no supera al desbalanceado.")
+for a, b in [(1, 3), (2, 4), (5, 7), (6, 8)]:
+    chequear(F3.set_index("#").loc[b, "KM inertia"] > F3.set_index("#").loc[a, "KM inertia"], f"La inertia con outliers (caso {b}) ya no supera a la del caso {a}.")
+
+ct_km = pd.read_csv(f"{D}/crosstab_caso8_kmeans.csv", index_col=0)
+ct_db = pd.read_csv(f"{D}/crosstab_caso8_dbscan.csv", index_col=0)
+# K-Means caso 8: el cluster "limpio" es el que concentra más Good + Satisfactory
+km_clean = int(ct_km.loc[["Good", "Satisfactory"]].sum().idxmax())
+km_dirty = 1 - km_clean
+km_share = lambda cl, cls_: ct_km.loc[cls_, str(cl)].sum() / ct_km.loc[cls_].sum().sum()
+chequear(km_share(km_dirty, ["Severe"]) > 0.7 and km_share(km_clean, ["Good"]) > 0.9, "El cruce de K-Means (caso 8) ya no separa limpio vs contaminado.")
+db_noise_share = {c: ct_db.loc[c, "-1"] / ct_db.loc[c].sum() for c in CLASES}
+db_cl = ct_db.drop(columns="-1")
+db_big = int(db_cl.sum().idxmax())
+sev_cl = int(db_cl.loc["Severe"].idxmax())
+sev_purity = db_cl.loc["Severe", str(sev_cl)] / db_cl[str(sev_cl)].sum()
+chequear(db_noise_share["Moderate"] > 0.5 and db_noise_share["Poor"] > 0.5 and db_noise_share["Good"] < 0.15, "El ruido de DBSCAN (caso 8) ya no se concentra en las clases intermedias.")
+chequear((db_cl.loc[["Good", "Satisfactory"], str(db_big)].sum() / db_cl[str(db_big)].sum()) > 0.6, "El cluster grande de DBSCAN (caso 8) ya no es de aire limpio.")
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Diagramas (se guardan en WORK)
+# ----------------------------------------------------------------------------------------------------------------------
 def diagrama():
     fig, ax = plt.subplots(figsize=(11, 3.6)); ax.axis("off"); ax.set_xlim(0, 11); ax.set_ylim(0, 3.6)
-    cajas = [(0.1, "city_day.csv\n(29 531 filas)"), (1.85, "Subconjunto\nN según cédula\n+ semilla"), (3.6, "Split estratificado\n70 / 15 / 15"),
-             (5.35, "Imputación (train)\nmediana / moda"), (7.1, "Caso 1..8:\nrecorte / outliers 5 %\nbalanceo · One-Hot\nescalado (fit train)"), (9.0, "Modelos\nÁrbol · KNN · SVM · RN\nK-Means · DBSCAN")]
+    cajas = [(0.1, f"city_day.csv\n({J['filas_originales']:,} filas)".replace(",", " ")), (1.85, "Subconjunto\nN según cédula\n+ semilla"),
+             (3.6, "Partición estratificada\n70 / 15 / 15"), (5.35, "Imputación (train)\nmediana / moda"),
+             (7.1, "Caso 1..8:\nrecorte / outliers 5 %\nbalanceo · One-Hot\nescalado (fit train)"), (9.0, "Modelos\nÁrbol · KNN · SVM · RN\nK-Means · DBSCAN")]
     for x, t in cajas:
         ax.add_patch(FancyBboxPatch((x, 1.2), 1.6, 1.4, boxstyle="round,pad=0.05", fc="#e8f0fe", ec="#3b5bdb"))
         ax.text(x + 0.8, 1.9, t, ha="center", va="center", fontsize=8)
     for x in [1.7, 3.45, 5.2, 6.95, 8.7]:
         ax.annotate("", xy=(x + 0.2, 1.9), xytext=(x - 0.02, 1.9), arrowprops=dict(arrowstyle="->", color="#444"))
-    ax.text(5.5, 0.55, "Val y test reciben el mismo tratamiento en los 8 casos; encoders, escalador, imputador, SMOTE e inyección de outliers se ajustan solo con train.",
+    ax.text(5.5, 0.55, "Validación y prueba reciben el mismo tratamiento en los 8 casos; imputador, codificador, escalador, SMOTE e inyección\nde outliers se ajustan únicamente con el conjunto de entrenamiento.",
             ha="center", fontsize=8.5, style="italic")
-    ax.text(5.5, 3.2, "Flujo general de preprocesamiento", ha="center", fontsize=11, weight="bold")
-    plt.savefig(f"{D}/diagrama_pipeline.png", dpi=150, bbox_inches="tight"); plt.close()
-
-
-diagrama()
+    plt.savefig(f"{WORK}/diagrama_pipeline.png", dpi=170, bbox_inches="tight"); plt.close()
 
 
 def diagrama_red():
-    """Esquema de la arquitectura del MLP (entrada -> 2 capas ocultas con L2 y Dropout -> softmax)."""
-    capas = [("Entrada\n43 variables", "#e8f0fe"), ("Dense 64\nReLU · L2 1e-3", "#d3f9d8"), ("Dropout\n0.3", "#ffe3e3"),
+    capas = [(f"Entrada\n{n_feat} variables", "#e8f0fe"), ("Dense 64\nReLU · L2 1e-3", "#d3f9d8"), ("Dropout\n0.3", "#ffe3e3"),
              ("Dense 32\nReLU · L2 1e-3", "#d3f9d8"), ("Dropout\n0.3", "#ffe3e3"), ("Dense 6\nSoftmax", "#e5dbff")]
     fig, ax = plt.subplots(figsize=(11, 2.4)); ax.axis("off"); ax.set_xlim(0, 11); ax.set_ylim(0, 2.4)
     for i, (t, c) in enumerate(capas):
@@ -104,403 +196,678 @@ def diagrama_red():
         if i < len(capas) - 1:
             ax.annotate("", xy=(x + 1.80, 1.2), xytext=(x + 1.47, 1.2), arrowprops=dict(arrowstyle="->", color="#444"))
     ax.text(5.5, 0.25, "Adam · categorical_crossentropy (one-hot) · lotes de 64 · hasta 200 épocas · EarlyStopping (val_loss, paciencia 10)", ha="center", fontsize=8.5, style="italic")
-    plt.savefig(f"{D}/diagrama_red.png", dpi=150, bbox_inches="tight"); plt.close()
+    plt.savefig(f"{WORK}/diagrama_red.png", dpi=170, bbox_inches="tight"); plt.close()
 
 
-diagrama_red()
-
-# ---------------------------- helpers HTML ----------------------------
-def fig(name, caption, w="100%"):
-    return f'<figure style="width:{w}"><img src="{name}"><figcaption>{caption}</figcaption></figure>'
+diagrama(); diagrama_red()
 
 
-def df_html(df, cls="t", index=False):
-    return df.to_html(index=index, classes=cls, border=0, escape=False)
+def img(name):
+    """Ruta de una imagen: primero salidas/, luego los diagramas generados."""
+    for base in (D, WORK):
+        if os.path.exists(f"{base}/{name}"):
+            return f"{base}/{name}"
+    raise FileNotFoundError(name)
 
 
-def fig1_html():
-    hdr = "".join(f'<th colspan="4">{m}</th>' for m in MODELOS)
-    sub = "<th>Acc</th><th>Prec</th><th>Rec</th><th>F1</th>" * 4
-    rows = ""
+# ----------------------------------------------------------------------------------------------------------------------
+# Tablas (devuelven especificaciones neutras)
+# ----------------------------------------------------------------------------------------------------------------------
+def tabla_fig1():
+    hdr1 = [("#", 1, 2), ("Normalización", 1, 2), ("Outliers", 1, 2), ("Balanceo", 1, 2)] + [(m, 4, 1) for m in MODELOS]
+    hdr2 = [("Acc", 1, 1), ("Prec", 1, 1), ("Rec", 1, 1), ("F1", 1, 1)] * 4
+    rows = []
     for c in range(1, 9):
         cf = CASOS[c]
-        celdas = "".join(f"<td>{P[k].loc[c, m]:.3f}</td>" if k != "f1" else f"<td><b>{P[k].loc[c, m]:.3f}</b></td>"
-                         for m in MODELOS for k in ["accuracy", "precision", "recall", "f1"])
-        rows += f"<tr><td>{c}</td><td>CC(SI) y ED({SI(cf['ED'])})</td><td>{SI(cf['OUT'])}</td><td>{SI(cf['BAL'])}</td>{celdas}</tr>"
-    return (f'<table class="t small"><tr><th rowspan="2">#</th><th rowspan="2">Normalización</th><th rowspan="2">Outliers</th><th rowspan="2">Balanceo</th>{hdr}</tr>'
-            f'<tr>{sub}</tr>{rows}</table>')
+        rows.append([str(c), f"CC(SI) y ED({SI(cf['ED'])})", SI(cf["OUT"]), SI(cf["BAL"])] +
+                    [(f"{P[k].loc[c, m]:.3f}" if k != "f1" else f"**{P[k].loc[c, m]:.3f}**") for m in MODELOS for k in ["accuracy", "precision", "recall", "f1"]])
+    return dict(header=[hdr1, hdr2], rows=rows, widths=[0.6, 2.7, 1.6, 1.6] + [1.08] * 16, size=7.5, align_first=False)
 
 
-def fig3_html():
-    d = F3.copy()
-    out = pd.DataFrame({"#": d["#"], "Normalización": d["ED"].map(lambda x: f"CC(SI) y ED({x})"), "Outliers": d["Outliers"], "Balanceo": d["Balanceo"],
-                        "K-Means<br>Inertia": d["KM inertia"].map(lambda x: f"{x:,.0f}"), "K-Means<br>Silhouette": d["KM silhouette"].map(lambda x: f"{x:.3f}"),
-                        "DBSCAN<br>Silhouette": d["DB silhouette"].map(lambda x: "n/a (1 cluster)" if pd.isna(x) else f"{x:.3f}"),
-                        "K elegido<br>(codo)": d.apply(lambda r: f"{r['K óptimo (silhouette)']} ({r['K codo']})", axis=1),
-                        "DBSCAN<br>clusters / ruido": d.apply(lambda r: f"{r['DB clusters']} / {r['DB ruido %']:.1f} %", axis=1),
-                        "ε codo → usado": d.apply(lambda r: f"{r['DB eps codo']:.2f} → {r['DB eps usado']:.2f}", axis=1)})
-    return df_html(out, "t small")
+def tabla_fig3():
+    d = F3
+    hdr = [[("#", 1, 2), ("Normalización", 1, 2), ("Outliers", 1, 2), ("Balanceo", 1, 2), ("K-Means", 2, 1), ("DBSCAN", 1, 1), ("Parámetros elegidos", 3, 1)],
+           [("Inertia", 1, 1), ("Silhouette", 1, 1), ("Silhouette", 1, 1), ("K (codo)", 1, 1), ("Clusters / ruido", 1, 1), ("ε codo → ε usado", 1, 1)]]
+    rows = []
+    for _, r in d.iterrows():
+        rows.append([str(int(r["#"])), f"CC(SI) y ED({r['ED']})", r["Outliers"], r["Balanceo"], f"{r['KM inertia']:,.0f}".replace(",", " "), f"{r['KM silhouette']:.3f}",
+                     "n/a (1 cluster)" if pd.isna(r["DB silhouette"]) else f"{r['DB silhouette']:.3f}",
+                     f"{int(r['K óptimo (silhouette)'])} ({int(r['K codo'])})", f"{int(r['DB clusters'])} / {r['DB ruido %']:.1f} %",
+                     f"{r['DB eps codo']:.2f} → {r['DB eps usado']:.2f}"])
+    return dict(header=hdr, rows=rows, widths=[0.7, 3.0, 1.8, 1.8, 2.6, 2.2, 2.8, 2.0, 2.8, 3.0], size=8.5, align_first=False)
 
 
-def rep_html():
-    filas = []
-    for m in MODELOS:
-        r = pd.read_csv(f"{D}/reporte_clases_caso8_{m.replace(' ', '_')}.csv", index_col=0)
-        filas.append([m] + [f"{r.loc[c, 'recall']:.2f} / {r.loc[c, 'f1-score']:.2f}" for c in CLASES])
-    return df_html(pd.DataFrame(filas, columns=["Modelo (caso 8)"] + CLASES), "t small")
+def tabla_simple(df, widths=None, size=9, align_first=True):
+    return dict(header=[[(str(c), 1, 1) for c in df.columns]], rows=[[str(x) for x in r] for r in df.values.tolist()], widths=widths, size=size, align_first=align_first)
 
 
-def efectos_html():
-    filas = []
-    for m in MODELOS:
-        filas.append([m] + [f"{sg(ef[k][2][m])}" for k in ["ED", "OUT", "BAL"]])
-    return df_html(pd.DataFrame(filas, columns=["Modelo", "Escalado (SI−NO)", "Outliers (SI−NO)", "Balanceo (SI−NO)"]), "t")
+def tabla_recall():
+    filas = [[m] + [f"{rep(m).loc[c, 'recall']:.2f} / {rep(m).loc[c, 'f1-score']:.2f}" for c in CLASES] for m in MODELOS]
+    return tabla_simple(pd.DataFrame(filas, columns=["Modelo"] + CLASES), widths=[3.2] + [2.2] * 6, size=8.5)
 
 
-def ct_html(algo):
-    ct = pd.read_csv(f"{D}/crosstab_caso8_{algo}.csv", index_col=0)
-    ct.columns = [("ruido" if str(c) == "-1" else f"cluster {c}") for c in ct.columns]
-    ct.index.name = "Clase real"
-    return df_html(ct.reset_index(), "t small")
+def tabla_efectos():
+    filas = [[m] + [sg(ef[k][2][m]) for k in ["ED", "OUT", "BAL"]] for m in MODELOS]
+    return tabla_simple(pd.DataFrame(filas, columns=["Modelo", "Escalado (SI − NO)", "Outliers (SI − NO)", "Balanceo (SI − NO)"]), widths=[3.8, 3.6, 3.6, 3.6])
 
 
-roc = J["roc_caso8"]
-mx = {m: (f1[m].max(), int(f1[m].idxmax())) for m in MODELOS}
-c8 = f1.loc[8]
-tree_top8 = ", ".join(f"{k} ({v:.2f})" for k, v in J["arbol"]["8"]["top_features"].items())
-k_bal = [J["knn_k"][str(c)] for c in range(1, 9) if CASOS[c]["BAL"]]
-nn_ep = J["nn_epocas"]
-casos_tr = J["casos"]
-sev = {m: pd.read_csv(f"{D}/reporte_clases_caso8_{m.replace(' ', '_')}.csv", index_col=0).loc["Severe", "recall"] for m in MODELOS}
-km8 = F3.iloc[7]; km1 = F3.iloc[0]; km3 = F3.iloc[2]; km5 = F3.iloc[4]; km7 = F3.iloc[6]
-out_pct_km = 100 * (km3["KM inertia"] / km1["KM inertia"] - 1)
-out_pct_km_ed = 100 * (km7["KM inertia"] / km5["KM inertia"] - 1)
-db_unbal = F3[F3.Balanceo == "NO"]; db_bal = F3[F3.Balanceo == "SI"]
-sil_ed_no = F3[F3.ED == "NO"]["KM silhouette"].mean(); sil_ed_si = F3[F3.ED == "SI"]["KM silhouette"].mean()
-sil_bal_no = F3[F3.Balanceo == "NO"]["KM silhouette"].mean(); sil_bal_si = F3[F3.Balanceo == "SI"]["KM silhouette"].mean()
-nul = J["nulos_pct"]
-AUTORES = ", ".join(f"{n}<sup>{k + 1}</sup>" for k, n in enumerate(INTEGRANTES[:-1])) + f" y {INTEGRANTES[-1]}<sup>{len(INTEGRANTES)}</sup>"
-n_train_unb = casos_tr["1"]["n_train"]; n_train_bal = casos_tr["2"]["n_train"]
-ultimo_dig = (J["n_registros"] - 5000) // 150
-dist = J["dist_subconjunto"]
+def tabla_cruce(ct):
+    ct = ct.copy()
+    ct.columns = ["ruido" if str(c) == "-1" else f"cluster {c}" for c in ct.columns]
+    t = ct.reset_index().rename(columns={"row_0": "Clase real", "index": "Clase real"})
+    t.columns = ["Clase real"] + list(ct.columns)
+    return tabla_simple(t, widths=[3.0] + [1.9] * len(ct.columns), size=8.5)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Contenido del informe (lista de bloques)
+# Tipos: h1, h2, p, ul, ol, table(caption, spec), fig(file, caption, ancho_cm), figs2([(file, caption), ...]), eq, note, landscape(True/False)
+# Marcado en línea: **negrita**  *cursiva*  `código`  ^superíndice^  ==resaltado==  <<url|texto>>  y referencias [[fig:clave]] / [[tab:clave]]
+# ----------------------------------------------------------------------------------------------------------------------
+B = []
+add = B.append
+h1 = lambda t: add(("h1", t))
+h2 = lambda t: add(("h2", t))
+p = lambda t: add(("p", t))
+ul = lambda items: add(("ul", items))
+ol = lambda items: add(("ol", items))
+note = lambda t: add(("note", t))
+eq = lambda t: add(("eq", t))
+table = lambda key, cap, spec: add(("table", key, cap, spec))
+fig = lambda key, f, cap, w=15.5: add(("fig", key, f, cap, w))
+figs2 = lambda items: add(("figs2", items))
+
+AUTORES = ", ".join(f"{n}^{k + 1}^" for k, n in enumerate(INTEGRANTES[:-1])) + f" y {INTEGRANTES[-1]}^{len(INTEGRANTES)}^"
 dist_txt = ", ".join(f"{k}: {v}" for k, v in dist.items())
+video_txt = f"<<{VIDEO_URL}|{VIDEO_URL}>>" if VIDEO_URL else "==[PENDIENTE: pegar aquí el enlace de YouTube del video pitch]=="
+best = R.loc[R.f1.idxmax()]
+tasa_out = J["outliers_train_natural_filas_pct"]
+out_inertia = {(a, b): 100 * (F3.set_index("#").loc[b, "KM inertia"] / F3.set_index("#").loc[a, "KM inertia"] - 1) for a, b in [(1, 3), (2, 4), (5, 7), (6, 8)]}
+sil_ed_no, sil_ed_si = F3[F3.ED == "NO"]["KM silhouette"].mean(), F3[F3.ED == "SI"]["KM silhouette"].mean()
+sil_bal_no, sil_bal_si = F3[F3.Balanceo == "NO"]["KM silhouette"].mean(), F3[F3.Balanceo == "SI"]["KM silhouette"].mean()
+d_out_case = {(a, b): f1.loc[b, "Árboles"] - f1.loc[a, "Árboles"] for a, b in [(1, 3), (2, 4)]}
+gini_cases = [c for c in range(1, 9) if arbol[str(c)]["criterio"] == "gini"]
+ent_cases = [c for c in range(1, 9) if arbol[str(c)]["criterio"] == "entropy"]
+f3i = F3.set_index("#")
 
-def anexo_html():
-    t3 = T3.copy(); t3.columns = ["Caso", "Dato de prueba", "Clase real"] + MODELOS
-    t3u = T3u.copy(); t3u.columns = ["Caso", "Dato de prueba", "Clase real (solo referencia)", "Cluster K-Means", "Cluster DBSCAN (-1 = ruido)"]
-    h = "<h2>Anexo A. Tres datos de prueba en los 8 casos</h2><h3>A.1 Supervisado</h3>" + df_html(t3, "t small")
-    h += "<h3>A.2 No supervisado</h3>" + df_html(t3u, "t small")
-    h += "<h2>Anexo B. Visualizaciones por caso</h2><p>El enunciado pide las visualizaciones de cada técnica para los 8 casos. En el cuerpo del documento se analiza el caso 8; aquí van todos.</p>"
-    for titulo, patron, ancho, cap in [("B.1 Árboles de decisión: importancia, max_depth vs accuracy (Gini vs Entropía) y árbol Gini", "arbol_caso{c}.png", "100%", "Árbol de decisión"),
-                                      ("B.2 KNN: k vs accuracy (CV 5 folds) y vecinos en PCA 2D", "knn_caso{c}.png", "100%", "KNN"),
-                                      ("B.3 SVM: regiones de decisión en PCA 2D", "svm_regiones_caso{c}.png", "49%", "SVM"),
-                                      ("B.4 Clusters en PCA 2D (K-Means con centroides, DBSCAN con ruido en gris)", "clusters_caso{c}.png", "100%", "Clusters")]:
-        h += f"<h3>{titulo}</h3>"
-        h += '<div style="display:flex;flex-wrap:wrap;gap:6px">' if ancho != "100%" else "<div>"
-        for c in range(1, 9):
-            if os.path.exists(f"{D}/{patron.format(c=c)}"):
-                h += fig(patron.format(c=c), f"{cap} – caso {c}", ancho)
-        h += "</div>"
-    return h
+add(("title", dict(titulo="Trabajo Práctico 2", subtitulo="Calidad del aire en India: clasificación y agrupamiento del AQI", autores=AUTORES,
+                   afil=f"Universidad Nacional de Colombia, Sede Medellín\nIntroducción a la Inteligencia Artificial (3010476) · Grupo {J['grupo']}, Equipo {J['equipo']}")))
+add(("abstract",
+     f"**Resumen.** Se trabajó con {J['n_registros']} registros de calidad del aire de 26 ciudades de India para clasificar el índice de calidad del aire (AQI) en seis categorías, "
+     f"de *Good* a *Severe*, y luego agrupar los datos sin etiqueta. Se construyeron ocho versiones del conjunto de datos combinando escalado, un 5 % de valores atípicos y balanceo de clases; "
+     f"en cada una se entrenaron un árbol de decisión, KNN, una SVM y una red neuronal y, con las mismas versiones y sin la etiqueta, K-Means y DBSCAN. "
+     f"El F1 macro más alto fue {best.f1:.3f} ({best.modelo}, caso {int(best.caso)}). El balanceo de clases fue la decisión de mayor efecto en los cuatro modelos; "
+     f"el escalado fue determinante para la red neuronal y la SVM, nulo para el árbol y desfavorable para KNN; y los valores atípicos inyectados modificaron poco el F1 medio. "
+     f"En el aprendizaje no supervisado, K-Means separó el aire limpio del contaminado (K = 2 en los ocho casos) y DBSCAN solo encontró estructura de varios clusters con los datos balanceados."))
+add(("p", f"**Enlace del video (pitch):** {video_txt}"))
+
+# ------------------------------------------------------------------ 1
+h1("Formulación del problema y dataset")
+h2("Objetivo y alcance")
+p("El trabajo implementa y compara técnicas de aprendizaje de máquinas sobre un dataset abierto: clasificación supervisada con árboles de decisión, KNN, máquinas de vectores de soporte (SVM) "
+  "y redes neuronales; y agrupamiento no supervisado con K-Means y DBSCAN. Cada técnica se evalúa frente a ocho combinaciones de preprocesamiento (escalado, outliers y balanceo de clases), "
+  "de modo que el análisis se centra en cómo cada decisión de preparación de datos cambia el comportamiento de cada modelo.")
+h2("Fuente del dataset y justificación")
+p(f"Se utilizó *Air Quality Data in India* (Kaggle, Rohan Rao; <<{DATASET_URL}|enlace al dataset>>), archivo `city_day.csv`: mediciones diarias de contaminantes en 26 ciudades de India "
+  "entre 2015 y 2020. Se eligió porque (a) la variable objetivo `AQI_Bucket` tiene seis clases ordenadas por severidad; (b) combina variables numéricas y categóricas; "
+  "(c) presenta valores nulos y valores extremos reales, por lo que el preprocesamiento exigido tiene un efecto verificable; y (d) los errores de clasificación tienen un costo distinto según su sentido: "
+  "declarar *Moderate* cuando el aire está en *Severe* deja a la población sin alerta, mientras que el error contrario genera una alerta innecesaria.")
+p("Las categorías corresponden a los rangos del índice de calidad del aire de India (CPCB) que definen `AQI_Bucket`:")
+table("aqi", "Rangos del AQI que definen las seis clases de AQI_Bucket.",
+      tabla_simple(pd.DataFrame([["Rango de AQI", "0–50", "51–100", "101–200", "201–300", "301–400", "401–500"]], columns=["AQI_Bucket"] + CLASES), size=9, align_first=True))
+h2("Descripción de las variables")
+table("vars", "Variables del conjunto de datos y uso en los modelos.", tabla_simple(pd.DataFrame([
+    ["City", "Categórica nominal (26 ciudades)", "One-Hot"],
+    ["Date", "Fecha (2015–2020)", "Se derivan `Season` (Winter, Summer, Monsoon, PostMonsoon; nominal, One-Hot) y `Year` (ordinal, por orden temporal)"],
+    ["PM2.5, PM10, NO, NO2, NOx, NH3, CO, SO2, O3, Benzene, Toluene, Xylene", "Numéricas continuas (12)", "Imputación con mediana, recorte IQR y escalado"],
+    ["AQI", "Numérica", "**Excluida**: `AQI_Bucket` se calcula directamente a partir de ella (fuga de información)"],
+    ["AQI_Bucket", "Objetivo, 6 clases ordenadas", "Good < Satisfactory < Moderate < Poor < Very Poor < Severe"]],
+    columns=["Variable", "Tipo", "Uso en el modelo"]), widths=[4.6, 4.2, 7.0], size=8.5))
+h2("Verificación de requisitos del dataset")
+ul([f"Cédula utilizada: **{J['cedula']}**. Último dígito distinto de cero = {ultimo_dig}, de modo que el tamaño del subconjunto es 5000 + {ultimo_dig} × 150 = **{J['n_registros']}** registros; "
+    f"la semilla (*random state*) son los dos últimos dígitos distintos de cero: **{J['seed']}** (distinta de 42).",
+    f"Registros del archivo original: {J['filas_originales']:,}; con etiqueta: {J['filas_etiquetadas']:,}. Subconjunto de trabajo: {J['n_registros']} (≥ 5000), muestreado al azar con `random_state={J['seed']}`.".replace(",", " "),
+    f"Clases de la variable objetivo: 6 (≥ 4). Distribución del subconjunto: {dist_txt}.",
+    "Variables numéricas (12) y categóricas (City, Season, Year).",
+    f"Partición estratificada: entrenamiento {J['tamanos_split']['tr']}, validación {J['tamanos_split']['va']}, prueba {J['tamanos_split']['te']} (70/15/15)."])
+eq(f"N = 5000 + d · 150 = 5000 + {ultimo_dig} · 150 = {J['n_registros']}")
+
+# ------------------------------------------------------------------ 2
+h1("Preprocesamiento")
+fig("pipeline", "diagrama_pipeline.png", "Flujo general del preprocesamiento. Todo lo que aprende de los datos se ajusta solo con entrenamiento.", 16)
+h2("Análisis exploratorio y valores nulos")
+p(f"El subconjunto tiene {J['n_registros']} filas y 16 columnas (City, Season, Year, 12 contaminantes y la etiqueta). La columna con más nulos es Xylene ({nul['Xylene']:.1f} %), seguida de PM10 ({nul['PM10']:.1f} %), "
+  f"NH3 ({nul['NH3']:.1f} %) y Toluene ({nul['Toluene']:.1f} %); el resto está por debajo de {max(v for k, v in nul.items() if k not in ('Xylene', 'PM10', 'NH3', 'Toluene')):.0f} %. "
+  "Se imputó con la **mediana** (calculada solo con entrenamiento) porque los contaminantes tienen colas muy pesadas y la media se ve arrastrada por los picos; para las categóricas se usaría la moda. "
+  f"En Xylene la imputación es discutible porque más de la mitad de la columna es un valor imputado; se mantuvo la variable para respetar el enunciado y se registra como limitación.")
+corr_txt = ", ".join(f"{k} ({v})" for k, v in J["correlaciones_altas"].items())
+p(f"Pares con correlación absoluta superior a 0.8: {corr_txt}. Es esperable: PM2.5 está contenido en PM10 y NOx incluye al NO. Para los árboles no es un problema; para KNN y SVM implica que esa información pesa más en la distancia.")
+figs2([("eda_clases.png", "Distribución de clases del subconjunto."), ("eda_correlacion.png", "Matriz de correlación de las variables numéricas.")])
+h2("Decisiones de preprocesamiento y justificación")
+ul([f"**Conversión de categóricas (CC):** One-Hot para `City` y `Season`, porque no tienen un orden natural; codificación ordinal para `Year`, que sí tiene orden temporal. Es la decisión más discutible del dataset, "
+    "ya que no trae variables ordinales evidentes y `Year` fue la opción menos forzada.",
+    "**Escalado (ED):** `StandardScaler` ajustado solo con entrenamiento y aplicado a validación y prueba. Se prefirió a MinMax porque, con colas pesadas, un único valor extremo comprime al resto en un rango muy estrecho.",
+    f"**Detección de outliers:** IQR con factor 1.5 sobre las 12 variables numéricas, con límites calculados en entrenamiento. Bajo ese criterio el **{tasa_out} %** de las filas de entrenamiento tiene al menos un valor atípico "
+    f"(Xylene {J['outliers_por_variable_pct']['Xylene']} %, Toluene {J['outliers_por_variable_pct']['Toluene']} %), por lo que eliminarlos habría descartado más de la mitad de los datos.",
+    "**Sin outliers:** los valores detectados se recortan (*winsorizing*) a los límites IQR.",
+    f"**Con outliers:** al entrenamiento ya recortado se le inyecta sintéticamente el 5 % de las filas con un valor entre 1.5 y 4 IQR por encima del límite superior, en una variable numérica elegida al azar: "
+    f"{casos_tr['3']['outliers']['n_inyectados']} filas en los casos 3 y 7 (de {n_train_unb}) y {casos_tr['4']['outliers']['n_inyectados']} filas en los casos 4 y 8 (de {n_train_bal}), es decir, "
+    f"{casos_tr['3']['outliers']['pct']:.2f} % y {casos_tr['4']['outliers']['pct']:.2f} %.",
+    f"**Desbalanceado:** submuestreo del entrenamiento hasta que la clase mayoritaria (Moderate) represente ≈ 70 % y las otras cinco queden iguales. Distribución resultante: "
+    f"{', '.join(f'{k} {v}' for k, v in casos_tr['1']['dist_train'].items())} ({n_train_unb} filas; Moderate = {pct(casos_tr['1']['dist_train']['Moderate'] / n_train_unb, 1)}).",
+    f"**Balanceado:** SMOTE sobre el entrenamiento natural hasta igualar las seis clases en {max(casos_tr['2']['dist_train'].values())} registros cada una ({n_train_bal} filas). Se eligió SMOTE porque interpola entre vecinos reales "
+    "en lugar de repetir filas idénticas (lo que favorecería el sobreajuste); se aplica en un espacio estandarizado temporal para que las distancias no estén dominadas por las variables de mayor magnitud, y las variables One-Hot se redondean a 0/1 después."])
+eq("límite inferior = Q1 − 1.5 · IQR        límite superior = Q3 + 1.5 · IQR        IQR = Q3 − Q1")
+h2("Partición y reproducibilidad")
+p(f"La partición estratificada 70/15/15 se realiza una sola vez con `random_state={J['seed']}`, de modo que el conjunto de prueba ({n_test} registros) es el mismo en los ocho casos, y la tabla de la Figura 1 es comparable fila contra fila. "
+  "Imputación, codificación, escalado, inyección de outliers y balanceo se ajustan únicamente con el conjunto de entrenamiento. La misma semilla se usa en el muestreo, la partición, los modelos, SMOTE, la inyección de outliers y las inicializaciones de la red.")
+note("**Tratamiento de validación y prueba.** Durante el desarrollo se comprobó que recortar los outliers solo en entrenamiento dejaba el conjunto de prueba con valores muy superiores a los vistos por los modelos, "
+     "lo que penalizaba artificialmente a KNN, SVM y las redes. Por ello validación y prueba reciben siempre el mismo recorte, con los límites aprendidos en entrenamiento, en los ocho casos. "
+     "Consecuencia: la prueba mide el desempeño con datos recortados y no ante outliers reales en predicción (véase la sección de limitaciones).")
+note(f"**Efecto del tamaño del entrenamiento.** Los casos con balanceo no solo cambian la proporción de clases, también el tamaño del entrenamiento ({n_train_unb} frente a {n_train_bal} filas), "
+     "de modo que parte de la mejora atribuida al balanceo puede deberse al mayor número de filas (sintéticas) disponibles.")
+
+# ------------------------------------------------------------------ 3
+h1("Aprendizaje supervisado")
+h2("Modelos y configuración")
+dep_txt = "; ".join(f"caso {c}: {arbol[str(c)]['criterio']}, profundidad {arbol[str(c)]['max_depth']}" for c in range(1, 9))
+table("cfg", "Configuración de las cuatro técnicas supervisadas.", tabla_simple(pd.DataFrame([
+    ["Árbol de decisión", f"Se evaluaron los criterios Gini y Entropía con `max_depth` ∈ {{2, 3, 4, 5, 6, 8, 10, 12, 15, 20}} y se eligió la combinación de mayor F1 macro en validación. Resultado por caso: {dep_txt}."],
+    ["KNN", f"k impar entre 1 y 25, elegido por accuracy medio de validación cruzada de 5 folds. k elegido por caso: {', '.join(str(knn_k[str(c)]) for c in range(1, 9))}."],
+    ["SVM", "Kernel RBF, C = 1, gamma = 'scale'. Para las curvas ROC/PR se usan los puntajes de `decision_function`, que no son probabilidades calibradas."],
+    ["Red neuronal (MLP)", f"Dense(64, ReLU, L2 1e-3) → Dropout 0.3 → Dense(32, ReLU, L2 1e-3) → Dropout 0.3 → Dense(6, softmax). Adam, `categorical_crossentropy` con etiquetas one-hot, lotes de 64, hasta 200 épocas, "
+     f"validación en `validation_data`. Regularización y callback vistos en clase: L2, Dropout y `EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)`. El entrenamiento se detuvo entre {min(nn_ep.values())} y {max(nn_ep.values())} épocas según el caso."]],
+    columns=["Técnica", "Configuración"]), widths=[3.4, 12.4], size=8.5))
+fig("red", "diagrama_red.png", "Arquitectura de la red neuronal (MLP) usada en los ocho casos.", 16)
+p("La configuración de la red se obtuvo de forma incremental: se partió de una arquitectura pequeña y se aumentó la regularización hasta que las curvas de entrenamiento y validación dejaron de separarse (véase la curva del caso 8). "
+  "Las métricas son accuracy y precision, recall y F1 **macro** (promedio simple por clase), de modo que clases pequeñas como *Severe* pesan lo mismo que *Moderate*.")
+eq("F1 macro = (1/6) · Σ  2 · precisión_c · recall_c / (precisión_c + recall_c)")
+add(("landscape", True))
+h2("Resultados: Figura 1 del enunciado")
+table("fig1", f"Resultados de los modelos supervisados en los ocho casos (Figura 1 del enunciado). ED = escalado; CC siempre aplicada. Métricas sobre el mismo conjunto de prueba ({n_test} registros); en negrita, el F1 macro.", tabla_fig1())
+add(("landscape", False))
+h2("Gráficas solicitadas")
+figs2([("f1_max_algoritmo.png", "F1 macro máximo por algoritmo."), ("f1_medio_ed.png", "F1 macro medio por escalado y algoritmo.")])
+figs2([("f1_medio_outliers.png", "F1 macro medio por manejo de outliers y algoritmo."), ("f1_medio_balanceo.png", "F1 macro medio por balanceo y algoritmo.")])
+p("La [[tab:efectos]] resume el efecto medio de cada decisión sobre el F1 macro (promedio de los cuatro casos con el factor en SI menos el promedio de los cuatro casos con el factor en NO).")
+table("efectos", "Efecto medio de cada decisión de preprocesamiento sobre el F1 macro.", tabla_efectos())
+ul([f"**Balanceo:** es la decisión de mayor efecto en los cuatro modelos ({', '.join(f'{m} {sg(BAL_[m])}' for m in MODELOS)}).",
+    f"**Escalado:** decisivo para la red ({sg(ED_['Redes Neuronales'])}) y la SVM ({sg(ED_['SVM'])}), nulo para el árbol ({sg(ED_['Árboles'])}) y desfavorable en promedio para KNN ({sg(ED_['KNN'])}).",
+    f"**Outliers:** efecto medio pequeño en todos los modelos (de {sg(min(OUT_))} a {sg(max(OUT_))}).",
+    f"**Ranking por F1 máximo:** {' > '.join(f'{m} ({v[0]:.3f}, caso {v[1]})' for m, v in ranking)}."])
+h2("Análisis de resultados")
+p(f"**Mejor modelo.** El F1 máximo general lo obtiene {ranking[0][0]} ({fmt(ranking[0][1][0])}, caso {ranking[0][1][1]}), seguido de {ranking[1][0]} ({fmt(ranking[1][1][0])}, caso {ranking[1][1][1]}), "
+  f"{ranking[2][0]} ({fmt(ranking[2][1][0])}, caso {ranking[2][1][1]}) y {ranking[3][0]} ({fmt(ranking[3][1][0])}, caso {ranking[3][1][1]}). En el caso 8, con todo el preprocesamiento aplicado, "
+  f"SVM ({fmt(c8['SVM'])}) y red ({fmt(c8['Redes Neuronales'])}) superan a árbol ({fmt(c8['Árboles'])}) y KNN ({fmt(c8['KNN'])}), que quedan prácticamente empatados. Las diferencias entre los mejores modelos son del orden de 0.01 "
+  "y provienen de una sola corrida por caso, por lo que no deben leerse como una superioridad concluyente.")
+p(f"**Sensibilidad a la escala.** El árbol produjo *exactamente* los mismos resultados con y sin escalado (casos 1 = 5, 2 = 6, 3 = 7 y 4 = 8): divide por umbrales sobre una variable a la vez y el escalado, al ser una transformación monótona, solo desplaza el umbral. "
+  f"La red neuronal y la SVM dependen de la escala ({sg(ED_['Redes Neuronales'])} y {sg(ED_['SVM'])} de F1 medio): con unidades crudas PM10 (cientos) y CO (unidades) no pesan por igual en el kernel RBF ni en los pesos de la red. "
+  f"El caso más marcado es la red neuronal sin escalar y con entrenamiento desbalanceado (casos 1 y 3): su F1 es {fmt(f1.loc[1, 'Redes Neuronales'], 4)} y su accuracy ({P['accuracy'].loc[1, 'Redes Neuronales']:.4f}) coincide con la proporción de *Moderate* en el conjunto de prueba "
+  f"({pct(mod_share, 2)}), lo que indica que la red colapsó a predecir siempre la clase mayoritaria. "
+  f"KNN fue la excepción al patrón habitual ({sg(ED_['KNN'])} de F1 medio): escalar lo favorece con el entrenamiento balanceado ({sg(f1.loc[6, 'KNN'] - f1.loc[2, 'KNN'])} y {sg(f1.loc[8, 'KNN'] - f1.loc[4, 'KNN'])} en los casos 2→6 y 4→8) "
+  f"y lo perjudica con el desbalanceado ({sg(f1.loc[5, 'KNN'] - f1.loc[1, 'KNN'])} y {sg(f1.loc[7, 'KNN'] - f1.loc[3, 'KNN'])} en 1→5 y 3→7). No se realizó un experimento que explique esa asimetría, por lo que se deja como observación sin causa comprobada.")
+p(f"**Outliers.** El efecto medio fue pequeño en los cuatro modelos (entre {sg(min(OUT_))} y {sg(max(OUT_))}), aunque en comparaciones puntuales el árbol varió hasta {max(abs(v) for v in d_out_case.values()):.3f} de F1 "
+  f"(caso 1→3: {sg(d_out_case[(1, 3)])}; caso 2→4: {sg(d_out_case[(2, 4)])}), con signos distintos según el balanceo, lo que sugiere variabilidad más que un efecto sistemático. "
+  "Dos factores explican la sensibilidad reducida: se inyectó un 5 % de valores moderados (1.5 a 4 IQR por encima del límite) y el conjunto de prueba va recortado, de modo que se mide cuánto perjudica *entrenar* con ruido, no cuánto perjudica recibirlo al predecir.")
+p(f"**Desbalance y por qué el accuracy engaña.** El balanceo fue la decisión de mayor efecto ({sg(BAL_['Árboles'])} en árbol, {sg(BAL_['KNN'])} en KNN, {sg(BAL_['SVM'])} en SVM y {sg(BAL_['Redes Neuronales'])} en red). "
+  "Con un entrenamiento dominado por *Moderate* (≈ 70 %), los modelos aprenden que predecir esa clase casi siempre es rentable y atienden mal a las clases pequeñas; un clasificador que respondiera siempre *Moderate* "
+  "tendría 70 % de accuracy sobre ese entrenamiento sin haber aprendido nada, y el caso extremo se observó en la red de los casos 1 y 3. En este trabajo el conjunto de prueba conserva la distribución natural "
+  f"(*Moderate* ≈ {pct(mod_share)}), por lo que el accuracy global se infla menos de lo que ocurriría con una prueba 70/30; el efecto se ve con mayor claridad en el recall por clase y en el F1 macro, que son las métricas reportadas.")
+p("**Costo de los errores y métrica priorizada.** En calidad del aire un falso negativo (declarar *Moderate* cuando el aire está en *Severe*) deja a la población sin alerta, mientras que un falso positivo (alertar de más) genera molestias y costos pero no daño directo a la salud. "
+  "Por ello se prioriza el **recall de las clases altas** (Poor, Very Poor y Severe) y se usa el **F1 macro** como resumen, ya que evita que *Moderate* y *Satisfactory* oculten los fallos en las clases poco frecuentes.")
+h2("Matrices de confusión y reporte por clase (caso 8)")
+fig("conf", "matrices_confusion_caso8.png", "Matrices de confusión de las cuatro técnicas en el caso 8 (conjunto de prueba).", 15)
+table("recall", "Recall / F1 por clase en el caso 8, conjunto de prueba.", tabla_recall())
+p(f"El recall de *Severe* en el caso 8 fue {', '.join(f'{m} {sev[m]:.2f}' for m in MODELOS)}; la clase más difícil para los cuatro modelos es *Poor* (F1 entre {min(poor_f1.values()):.2f} y {max(poor_f1.values()):.2f}). "
+  f"Entre el {min(adj.values()) * 100:.0f} % y el {max(adj.values()) * 100:.0f} % de los errores de cada modelo ocurre entre clases vecinas de la escala (por ejemplo, *Very Poor* predicho como *Severe*), "
+  "coherente con que el AQI es un continuo dividido por umbrales. Los reportes completos por clase (precisión, recall y F1) están en `salidas/reporte_clases_caso8_*.csv`.")
+h2("Curvas ROC y Precision-Recall (caso 8)")
+fig("roc", "roc_pr_caso8.png", "Curvas ROC y Precision-Recall (promedio micro, uno contra todos) de las cuatro técnicas en el caso 8.", 16)
+p(f"El AUC macro (uno contra todos) fue: red {roc['Redes Neuronales']['auc_macro']:.3f}, SVM {roc['SVM']['auc_macro']:.3f}, árbol {roc['Árboles']['auc_macro']:.3f} y KNN {roc['KNN']['auc_macro']:.3f}. "
+  f"El AUC-PR micro fue: red {roc['Redes Neuronales']['auc_pr_micro']:.3f}, SVM {roc['SVM']['auc_pr_micro']:.3f}, KNN {roc['KNN']['auc_pr_micro']:.3f} y árbol {roc['Árboles']['auc_pr_micro']:.3f}. "
+  "Red y SVM ordenan claramente mejor los casos que árbol y KNN. Un árbol de profundidad limitada reparte pocas probabilidades distintas (una por hoja), por lo que su curva es escalonada y tiene poca resolución para ordenar; "
+  f"con k = 1, las «probabilidades» de KNN son 0 o 1, lo que explica su AUC ROC, el más bajo. El AUC-PR de KNN supera al del árbol, pero con tan pocos umbrales la curva tiene muy pocos puntos y el área por trapecios resulta poco informativa, "
+  "así que para KNN se confía más en el AUC ROC y en el F1. Los puntajes de la SVM no son probabilidades calibradas, de modo que las curvas se comparan como rankings.")
+h2("Visualización por técnica")
+p(f"**Árbol de decisión.** Las variables más importantes en el caso 8 son: {', '.join(f'{k} ({v:.2f})' for k, v in arbol['8']['top_features'].items())}. "
+  "La figura incluye la importancia de características, la curva de `max_depth` frente al accuracy de entrenamiento y validación para Gini y Entropía, y el árbol obtenido con Gini (primeros niveles); "
+  "las reglas completas están en `salidas/reglas_arbol_casoN.txt`.")
+fig("arbol", "arbol_caso8.png", "Árbol de decisión (caso 8): importancia de características, `max_depth` vs accuracy (Gini y Entropía) y primeros niveles del árbol con Gini. Los ocho casos están en el Anexo B.", 16.3)
+p("**Lectura en el dominio.** Que PM2.5 y PM10 sean las variables dominantes es coherente con el dominio: el AQI se calcula a partir de subíndices por contaminante y el material particulado suele ser el de mayor peso. "
+  "La regla raíz del árbol Gini del caso 8 divide por PM10 (valor estandarizado ≤ −0.38); con PM10 muy bajo y CO bajo el árbol se orienta a *Good*, y con PM2.5 alto y CO alto a *Very Poor*. "
+  "Un hallazgo menos cómodo es que `City_Ahmedabad` aparece como la tercera variable más importante: el árbol usa esa ciudad como atajo porque presenta niveles persistentemente altos. Es útil para predecir, "
+  "pero es información de ubicación y no de contaminación, y no implica que estar en esa ciudad cause un peor AQI.")
+p(f"**Subajuste y sobreajuste.** La exactitud de entrenamiento crece hasta cerca de 1.0 al aumentar `max_depth`, mientras la de validación se estabiliza alrededor de 0.70 a partir de la profundidad 6; la diferencia entre ambas curvas es el sobreajuste. "
+  "Con profundidades de 2 a 3 ambas son bajas (subajuste). Gini y Entropía dieron curvas muy parecidas; "
+  f"la selección por F1 de validación favoreció Entropía en los casos {', '.join(map(str, ent_cases))} y Gini en los casos {', '.join(map(str, gini_cases))}. "
+  "El árbol que se dibuja es el mejor con criterio Gini, como pide el enunciado, aunque no coincida con el modelo evaluado en los casos donde ganó Entropía.")
+p(f"**KNN.** En los casos balanceados la validación cruzada eligió k = {', '.join(map(str, k_bal))} (siempre 1), con un accuracy de validación cruzada de ≈ 0.86 en el caso 8, mientras que en prueba el accuracy fue "
+  f"{P['accuracy'].loc[8, 'KNN']:.2f}. La diferencia es un efecto de SMOTE: los puntos sintéticos son interpolaciones de puntos reales y, al repartirse entre folds, un punto de validación tiene casi un «gemelo» en entrenamiento, "
+  "de modo que k = 1 parece excelente en validación cruzada sin serlo. Es una limitación reconocida: para los casos balanceados el k elegido es optimista.")
+fig("knn", "knn_caso8.png", "KNN (caso 8): k vs accuracy (validación cruzada de 5 folds) y vecinos de tres puntos de prueba en PCA 2D. Los vecinos se calculan en el espacio completo; PCA solo se usa para dibujar.", 16)
+p("**SVM.** Las regiones de decisión se organizan en franjas que van del aire más limpio al más contaminado y se solapan en la zona central, donde conviven *Moderate* y *Poor*. "
+  "Con dos componentes se pierde información, por lo que el solapamiento del dibujo exagera el del modelo real.")
+fig("svm", "svm_regiones_caso8.png", "Regiones de decisión de la SVM en PCA 2D (caso 8). Se reentrena una SVM sobre la proyección solo para poder dibujar; el modelo evaluado usa todas las variables.", 11)
+p(f"**Red neuronal.** En el caso 8 la pérdida de validación se aplana hacia la época 15 y el entrenamiento se detuvo en la época {nn_ep['8']} restaurando los mejores pesos; "
+  "la brecha entre entrenamiento y validación en accuracy es moderada gracias al Dropout y a la regularización L2.")
+fig("nn", "nn_curvas_caso8.png", "Curvas de pérdida y accuracy de la red neuronal (caso 8).", 15)
+h2("Tres datos de prueba (caso 8)")
+t8 = T3[T3.caso == 8].drop(columns="caso"); t8.columns = ["Dato de prueba", "Clase real"] + MODELOS
+table("tres_sup", "Tres datos de prueba, caso 8: clase real y predicción de cada técnica.", tabla_simple(t8, widths=[2.6, 3.0, 2.5, 2.5, 2.5, 2.7], size=8.5))
+p("Los mismos tres registros se evaluaron en los ocho casos (Anexo A). Tres ejemplos ilustran el uso de los modelos pero no permiten concluir sobre su calidad; la evidencia es la tabla de la Figura 1.")
+h2("Conclusiones del módulo supervisado")
+ul([f"Con el preprocesamiento completo (caso 8), SVM y red alcanzan F1 macro de {fmt(c8['SVM'])} y {fmt(c8['Redes Neuronales'])}, y árbol y KNN de {fmt(c8['Árboles'])} y {fmt(c8['KNN'])}. La diferencia más grande se debe a la preparación de los datos y no a la elección del algoritmo.",
+    "El árbol es el más robusto al preprocesamiento (no depende del escalado y reacciona poco a los outliers) y el más fácil de explicar; SVM y red necesitan datos escalados y ordenan mejor los casos según ROC/PR.",
+    "Para este dominio, SVM o red neuronal sobre datos escalados y balanceados son preferibles si importa el ranking de riesgo, y el árbol si importa explicar las reglas. En ambos casos conviene vigilar el recall de *Severe* y no el accuracy."])
+
+# ------------------------------------------------------------------ 4
+h1("Aprendizaje no supervisado")
+h2("Construcción de los casos")
+p("Se utiliza el mismo dataset sin la variable objetivo. Las ocho versiones de la Figura 2 son exactamente los conjuntos de entrenamiento del módulo supervisado (mismos registros, mismo recorte o inyección de outliers, "
+  "mismo balanceo, One-Hot y escalado) con la etiqueta descartada. Así, «balanceado» significa que los datos incluyen los puntos sintéticos de SMOTE y «desbalanceado» corresponde al submuestreo con 70 % de *Moderate*. "
+  "La etiqueta original solo se usa para la validación externa (cruce de cada cluster con la clase real) y para interpretar los clusters, nunca para entrenar.")
+h2("Configuración")
+ul([f"**K-Means:** inicialización k-means++, `n_init=10`, `random_state={J['seed']}`, K de 2 a 10. Se reportan inertia (codo) y silhouette (calculado sobre una muestra de 3000 puntos); el K elegido es el de mayor silhouette y el K del codo se muestra al lado.",
+    f"**DBSCAN:** MinPts = 2 × número de características = {2 * n_feat} (con {n_feat} columnas tras el One-Hot). ε se toma del codo de la curva de k-distancia (k = MinPts). El silhouette se calcula sin los puntos de ruido y requiere al menos dos clusters."])
+note("**Ajuste de ε.** Con el ε del codo, DBSCAN dejaba todos los datos en un solo cluster en varios casos (silhouette no calculable). Cuando ocurrió, se exploraron 12 valores de ε entre 0.3 y 0.95 veces el del codo y se eligió el de mayor silhouette "
+     "con al menos dos clusters y a lo sumo 50 % de ruido; si ninguno cumplía, se conservó el ε del codo. La [[tab:fig3]] muestra ambos valores. Es una decisión propia del equipo, no del procedimiento visto en clase.")
+add(("landscape", True))
+h2("Resultados: Figura 3 del enunciado")
+table("fig3", "Resultados de K-Means y DBSCAN en los ocho casos (Figura 3 del enunciado) y parámetros elegidos.", tabla_fig3())
+add(("landscape", False))
+fig("sil", "silhouette_por_caso.png", "Silhouette por caso para K-Means (izquierda) y DBSCAN (derecha; 0 indica que no es calculable).", 15)
+fig("param", "kmeans_dbscan_seleccion_parametros.png", "Selección de parámetros por caso: codo (inertia), silhouette vs K y curva de k-distancia (línea roja: ε del codo; verde punteada: ε usado).", 13)
+h2("Análisis de resultados")
+p(f"**K-Means.** El silhouette eligió K = 2 en los ocho casos, mientras que el codo sugirió entre {int(F3['K codo'].min())} y {int(F3['K codo'].max())}. La diferencia es informativa: las seis clases del AQI son más un continuo "
+  "(cada clase es un tramo de la misma escala) que seis grupos separados, así que el único corte limpio es «aire más limpio» frente a «aire más contaminado». "
+  f"Al cruzar con la etiqueta en el caso 8 (sobre el entrenamiento balanceado, con {max(casos_tr['2']['dist_train'].values())} registros por clase), el cluster {km_clean} reúne el {pct(km_share(km_clean, ['Good']))} de *Good*, el {pct(km_share(km_clean, ['Satisfactory']))} de *Satisfactory* y el {pct(km_share(km_clean, ['Moderate']))} de *Moderate*, "
+  f"mientras que el cluster {km_dirty} reúne el {pct(km_share(km_dirty, ['Severe']))} de *Severe* y el {pct(km_share(km_dirty, ['Very Poor']))} de *Very Poor*; *Poor* queda repartida ({pct(km_share(km_dirty, ['Poor']))} en el cluster {km_dirty}). "
+  "La partición tiene sentido para el dominio, aunque con K = 2 no pueden recuperarse las seis clases.")
+table("ct_km", "Cruce de clusters de K-Means con la clase real, caso 8 (solo interpretación; la etiqueta no intervino en el entrenamiento).", tabla_cruce(ct_km))
+p(f"**Efecto del escalado.** La inertia no es comparable entre casos con y sin escalado: sin escalar es del orden de millones ({f3i.loc[1, 'KM inertia']:,.0f} en el caso 1) y escalada de decenas de miles ({f3i.loc[5, 'KM inertia']:,.0f} en el caso 5), simplemente por las unidades. ".replace(",", " ") +
+  f"El silhouette sin escalar fue en promedio mayor ({sil_ed_no:.3f} frente a {sil_ed_si:.3f}), pero no debe leerse como una mejora: sin escalar, las variables de mayor magnitud dominan la distancia euclidiana y el agrupamiento depende casi de ellas, "
+  "lo que facilita separar dos grupos y eleva el silhouette. Este último razonamiento es una explicación plausible que no se comprobó con un experimento adicional.")
+p(f"**Efecto de los outliers.** La inyección del 5 % aumentó la inertia en {out_inertia[(1, 3)]:.0f} % sin escalar y desbalanceado (caso 1→3), {out_inertia[(2, 4)]:.0f} % sin escalar y balanceado (2→4), {out_inertia[(5, 7)]:.0f} % con escalado y desbalanceado (5→7) y "
+  f"{out_inertia[(6, 8)]:.0f} % con escalado y balanceado (6→8), mientras que el silhouette cambió poco. Es lo esperado: la inertia suma distancias al cuadrado y unos pocos puntos lejanos la inflan, pero el centroide se desplaza poco con solo 5 % de datos.")
+p(f"**Efecto del balanceo.** El silhouette medio de K-Means subió de {sil_bal_no:.3f} a {sil_bal_si:.3f} con los datos balanceados. No debe interpretarse como una mejora real de la estructura: SMOTE rellena el espacio entre puntos reales con puntos interpolados, lo que vuelve los grupos más compactos e infla el silhouette.")
+nz = {c: f3i.loc[c] for c in range(1, 9)}
+p(f"**DBSCAN.** Con el entrenamiento desbalanceado, DBSCAN dejó un único cluster en los casos 1, 5 y 7 (ruido de {f3i.loc[1, 'DB ruido %']:.1f} %, {f3i.loc[5, 'DB ruido %']:.1f} % y {f3i.loc[7, 'DB ruido %']:.1f} %) y, en el caso 3, "
+  f"2 clusters tras reducir ε de {f3i.loc[3, 'DB eps codo']:.1f} a {f3i.loc[3, 'DB eps usado']:.1f}, a costa de {f3i.loc[3, 'DB ruido %']:.0f} % de ruido. Con {n_train_unb} puntos en {n_feat} dimensiones y MinPts = {2 * n_feat}, la densidad es baja y se necesita un ε grande para que haya núcleos; a ese ε todo se conecta. "
+  f"Con los datos balanceados, que tienen más de cuatro veces más puntos, aparecieron entre {int(db_bal['DB clusters'].min())} y {int(db_bal['DB clusters'].max())} clusters, con {db_bal['DB ruido %'].min():.0f} a {db_bal['DB ruido %'].max():.0f} % de ruido. "
+  f"El caso 6 conserva el ε del codo y deja {f3i.loc[6, 'DB ruido %']:.1f} % de ruido, por lo que su silhouette ({f3i.loc[6, 'DB silhouette']:.3f}) se calcula sobre una fracción pequeña de los puntos. "
+  "El silhouette de DBSCAN excluye el ruido y se obtiene con ε distintos en cada caso, por lo que no es comparable con el de K-Means ni entre casos.")
+ct_cap = f"Cruce de clusters de DBSCAN con la clase real, caso 8 (−1 = ruido)."
+table("ct_db", ct_cap, tabla_cruce(ct_db))
+p(f"En el caso 8 el cruce muestra qué encontró DBSCAN: un cluster grande de aire limpio (el cluster {db_big} reúne el {pct(ct_db.loc['Good', str(db_big)] / ct_db.loc['Good'].sum())} de *Good* y el {pct(ct_db.loc['Satisfactory', str(db_big)] / ct_db.loc['Satisfactory'].sum())} de *Satisfactory*), "
+  f"un cluster dominado por *Severe* (el cluster {sev_cl}, con {pct(sev_purity)} de *Severe*) y varios más pequeños de *Poor*, *Very Poor* y *Severe*. El ruido concentra las clases intermedias: "
+  f"{pct(db_noise_share['Moderate'])} de *Moderate* y {pct(db_noise_share['Poor'])} de *Poor* frente a {pct(db_noise_share['Good'])} de *Good*. DBSCAN identifica los extremos densos, pero la franja intermedia es un continuo sin vacíos de densidad que delimiten clusters.")
+h2("Comparación entre K-Means y DBSCAN")
+table("cmp", "Comparación entre K-Means y DBSCAN.", tabla_simple(pd.DataFrame([
+    ["Forma de los clusters", "Esféricos o convexos (distancia al centroide)", "Arbitraria; en el PCA se ven regiones alargadas y manchas densas"],
+    ["Definir K", "Debe fijarse (codo y silhouette); aquí resultó 2", "No se define K, pero hay que acertar con ε y MinPts, más delicados que K"],
+    ["Ruido y outliers", "Todo punto cae en algún cluster; los outliers inflan la inertia", f"Marca el ruido explícitamente; con datos balanceados fue de {db_bal['DB ruido %'].min():.0f} a {db_bal['DB ruido %'].max():.0f} %"],
+    ["Densidades variables", "Indiferente a la densidad, solo mira distancia", "Sufre: un único ε no sirve para zonas densas y dispersas a la vez (aquí, un cluster o mucho ruido)"],
+    [f"Alta dimensión ({n_feat} columnas)", "Aguanta mejor", "La distancia pierde contraste y la densidad se diluye"]], columns=["Aspecto", "K-Means", "DBSCAN"]), widths=[3.4, 6.0, 6.4], size=8.5))
+h2("Visualización de clusters en 2D (PCA)")
+fig("clusters", "clusters_caso8.png", "Caso 8: K-Means (K = 2, centroides en rojo) y DBSCAN (ruido en gris) proyectados con PCA. Los ocho casos están en el Anexo B.", 16)
+p("K-Means corta la nube en dos mitades a lo largo del primer componente, que esencialmente ordena de aire más limpio a más contaminado; DBSCAN recoge las zonas densas y deja en gris la franja intermedia. "
+  "Los clusters son interpretables en términos del dominio (limpio frente a contaminado), con la salvedad de que PCA con dos componentes solo da una visión parcial de un espacio de " + f"{n_feat} dimensiones.")
+h2("Tres datos de prueba (caso 8)")
+u8 = T3u[T3u.caso == 8].drop(columns="caso"); u8.columns = ["Dato de prueba", "Clase real (solo referencia)", "Cluster K-Means", "Cluster DBSCAN (−1 = ruido)"]
+table("tres_uns", "Tres datos de prueba, caso 8: cluster asignado por K-Means y DBSCAN.", tabla_simple(u8, widths=[3.0, 4.4, 3.4, 4.4], size=8.5))
+p("K-Means asigna cada dato al centroide más cercano; DBSCAN no tiene `predict`, de modo que cada dato toma el cluster del punto núcleo más cercano si queda a una distancia ≤ ε y se marca como ruido en caso contrario.")
+h2("Conclusiones del módulo no supervisado")
+ul(["Los datos no presentan seis grupos naturales: el AQI es una escala continua dividida por umbrales. El agrupamiento recupera bien el eje «limpio ↔ contaminado» y mal las clases intermedias.",
+    "K-Means es estable y fácil de interpretar pero obliga a particionar todos los datos; DBSCAN es más explícito con el ruido pero muy sensible a ε, MinPts y al tamaño del conjunto.",
+    "Las comparaciones entre casos con y sin escalado, o con y sin balanceo, requieren cautela: la inertia depende de las unidades y SMOTE infla la cohesión."])
+
+# ------------------------------------------------------------------ 5
+h1("Conclusiones generales y limitaciones")
+ul(["Lo que más movió los resultados fue la preparación de los datos (balanceo y escalado) y que el conjunto de prueba recibiera el mismo tratamiento que el de entrenamiento; ningún algoritmo ganó por sí solo.",
+    "El patrón se repite en ambos módulos: árbol y K-Means son robustos y explicables; SVM, red neuronal y DBSCAN rinden o fallan según el preprocesamiento.",
+    "**Limitaciones.** (1) Una sola corrida por caso, sin repeticiones con varias semillas: diferencias de ≈ 0.01 no son concluyentes. (2) El tamaño del entrenamiento cambia entre balanceado y desbalanceado. "
+    f"(3) Xylene tiene {nul['Xylene']:.0f} % de nulos imputados con la mediana. (4) El k de KNN en los casos balanceados es optimista por el efecto de SMOTE en la validación cruzada. "
+    "(5) `Year` como variable ordinal es una decisión discutible. (6) El conjunto de prueba se recorta con límites de entrenamiento, por lo que no mide el desempeño ante outliers reales. "
+    "(7) El ajuste de ε en DBSCAN es una decisión propia, descrita en la sección de configuración del módulo no supervisado y, en el caso 6, deja una proporción alta de ruido. "
+    "(8) El cruce de clusters con la etiqueta del caso 8 se calcula sobre un entrenamiento que incluye puntos sintéticos."])
+
+# ------------------------------------------------------------------ 6
+h1("Origen de las técnicas respecto al material del curso")
+p("Para la sustentación se identifica qué herramientas provienen del material de clase y cuáles se incorporaron por exigencia del enunciado o por decisión del equipo.")
+table("curso", "Origen de cada técnica o decisión.", tabla_simple(pd.DataFrame([
+    ["Partición de datos", "Entrenamiento 70 % / validación 15 % / prueba 15 %; la validación decide hiperparámetros y la prueba se usa al final", "Clase de redes neuronales"],
+    ["Escalado", "StandardScaler ajustado en entrenamiento", "Taller 8; clase de K-Means"],
+    ["Árboles", "`DecisionTreeClassifier`, Gini frente a Entropía, `max_depth`, `feature_importances_`, `plot_tree`", "Clase de árboles de decisión"],
+    ["Métricas", "Accuracy, precisión, recall, F1 macro, matriz de confusión, ROC/AUC y Precision-Recall/AUC-PR", "Clase de métricas; taller 7"],
+    ["Red neuronal", "Dense, ReLU, softmax, entropía cruzada categórica con etiquetas one-hot, Adam, L2, Dropout, EarlyStopping", "Clase de redes neuronales; taller 8"],
+    ["K-Means", "Inicialización k-means++, codo con SSE (inertia), silhouette", "Clase de K-Means; taller 7"],
+    ["DBSCAN", "ε con la curva de k-distancia, MinPts = 2 × nº de características, silhouette sin ruido", "Clase de DBSCAN; taller 7"],
+    ["KNN y SVM", "KNN con k por validación cruzada de 5 folds; SVM con kernel RBF", "Exigidos por el enunciado"],
+    ["SMOTE, submuestreo, recorte IQR, PCA para graficar", "Balanceo, tratamiento de outliers y visualización", "Los nombra el enunciado"],
+    ["Búsqueda de un ε menor en DBSCAN", "Cuando el ε del codo deja un solo cluster", "Decisión del equipo"]], columns=["Tema", "Qué se usó", "Origen"]), widths=[3.6, 8.2, 4.0], size=8.5))
+
+# ------------------------------------------------------------------ 7
+h1("Reproducibilidad y ejecución")
+ol(["Abrir `practica2.ipynb` en Google Colab y subir `city_day.csv` (o dejar que `kagglehub` lo descargue).",
+    "Editar únicamente la celda de configuración (`CEDULA`, `GRUPO`, `EQUIPO`); el tamaño del subconjunto y la semilla se derivan automáticamente.",
+    "Ejecutar todas las celdas (*Entorno → Ejecutar todo*). Al final se genera `salidas.zip` con las tablas y figuras de este documento.",
+    "Descomprimir `salidas.zip` junto a `build_informe.py` y ejecutar `python build_informe.py` para regenerar este informe en formato Word; si alguna afirmación del texto deja de cumplirse con los nuevos números, la consola imprime «REVISAR TEXTO»."])
+
+# ------------------------------------------------------------------ 8
+h1("Enlaces")
+ul([f"Video de sustentación (máx. 5 min; participan todos los integrantes): {video_txt}", f"Conjunto de datos original: <<{DATASET_URL}|{DATASET_URL}>>"])
+
+# ------------------------------------------------------------------ Anexos
+add(("pagebreak",))
+add(("h1u", "Anexo A. Tres datos de prueba en los ocho casos"))
+t3 = T3.copy(); t3.columns = ["Caso", "Dato de prueba", "Clase real"] + MODELOS
+table("anexA1", "Anexo A.1: tres datos de prueba en los ocho casos (supervisado).", tabla_simple(t3, widths=[1.4, 2.4, 2.8, 2.4, 2.4, 2.4, 2.6], size=8))
+t3u_ = T3u.copy(); t3u_.columns = ["Caso", "Dato de prueba", "Clase real (solo referencia)", "Cluster K-Means", "Cluster DBSCAN (−1 = ruido)"]
+table("anexA2", "Anexo A.2: tres datos de prueba en los ocho casos (no supervisado).", tabla_simple(t3u_, widths=[1.4, 2.6, 4.2, 3.2, 4.2], size=8))
+add(("h1u", "Anexo B. Visualizaciones por caso"))
+p("El enunciado pide las visualizaciones de cada técnica para los ocho casos. En el cuerpo del documento se analiza el caso 8; aquí se incluyen todos.")
+for titulo, patron, w2, cap in [("B.1 Árboles de decisión: importancia, `max_depth` vs accuracy (Gini y Entropía) y árbol Gini", "arbol_caso{c}.png", False, "Árbol de decisión"),
+                                ("B.2 KNN: k vs accuracy (validación cruzada de 5 folds) y vecinos en PCA 2D", "knn_caso{c}.png", False, "KNN"),
+                                ("B.3 SVM: regiones de decisión en PCA 2D", "svm_regiones_caso{c}.png", True, "SVM"),
+                                ("B.4 Clusters en PCA 2D (K-Means con centroides, DBSCAN con ruido en gris)", "clusters_caso{c}.png", False, "Clusters")]:
+    add(("h2u", titulo))
+    items = [(patron.format(c=c), f"{cap}, caso {c}.") for c in range(1, 9)]
+    if w2:
+        for i in range(0, 8, 2):
+            figs2(items[i:i + 2])
+    else:
+        for f_, c_ in items:
+            fig(None, f_, c_, 15.5)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Numeración (pre-pasada): secciones, figuras y tablas; resolución de referencias
+# ----------------------------------------------------------------------------------------------------------------------
+sec = sub = 0; nf = nt = 0
+REF = {}
+NUM = []
+for blk in B:
+    t = blk[0]
+    if t == "h1":
+        sec += 1; sub = 0; NUM.append((blk[0], f"{sec}", blk[1]))
+    elif t == "h2":
+        sub += 1; NUM.append((blk[0], f"{sec}.{sub}", blk[1]))
+    elif t == "table":
+        nt += 1; REF["tab:" + blk[1]] = f"Tabla {nt}"
+    elif t == "fig":
+        nf += 1
+        if blk[1]: REF["fig:" + blk[1]] = f"Figura {nf}"
+    elif t == "figs2":
+        nf += len(blk[1])
+# la numeración de títulos se asigna en el mismo orden al dibujar
 
 
-ANEXO = anexo_html()
-
-FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-
-
-def font_faces():
-    """Latin Modern (la fuente de LaTeX) desde ./fonts; si faltan, cae a Liberation Serif / Times."""
-    faces = ""
-    for fam, f, w, st in [("LM", "lmroman10-regular.otf", "normal", "normal"), ("LM", "lmroman10-bold.otf", "bold", "normal"),
-                          ("LM", "lmroman10-italic.otf", "normal", "italic"), ("LM", "lmroman10-bolditalic.otf", "bold", "italic"),
-                          ("LMMono", "lmmono10-regular.otf", "normal", "normal")]:
-        path = os.path.join(FONT_DIR, f)
-        if os.path.exists(path):
-            faces += f"@font-face {{ font-family: '{fam}'; src: url('file://{path}'); font-weight: {w}; font-style: {st}; }}\n"
-    return faces
+def resolver(s):
+    return re.sub(r"\[\[(fig|tab):(\w+)\]\]", lambda m: REF.get(f"{m.group(1)}:{m.group(2)}", "¿?"), s)
 
 
-CSS = font_faces() + """
-@page { size: Letter; margin: 25mm 24mm 24mm 24mm; }
-@page :left  { @top-left  { content: counter(page) "\\00a0\\00a0\\00a0\\00a0\\00a0\\00a0 Introducción a la Inteligencia Artificial."; font: 9pt 'LM', 'Liberation Serif', serif; vertical-align: bottom; padding-bottom: 6mm; } }
-@page :right { @top-right { content: "Introducción a la Inteligencia Artificial.\\00a0\\00a0\\00a0\\00a0\\00a0\\00a0 " counter(page); font: 9pt 'LM', 'Liberation Serif', serif; vertical-align: bottom; padding-bottom: 6mm; } }
-@page :first { @top-right { content: none; } }
-html { counter-reset: sec fig tab; }
-body { font-family: 'LM', 'Latin Modern Roman', 'Liberation Serif', 'Times New Roman', serif; font-size: 10pt; line-height: 1.27; color: #000;
-       text-align: justify; hyphens: auto; -webkit-hyphens: auto; }
-p { margin: 0.2em 0 0.2em 0; text-indent: 1.5em; }
-h2 + p, h3 + p, figure + p, table + p, .tcap + p, ul + p, ol + p, .abstract + p, div + p { text-indent: 0; }
-/* título y autores */
-.titleblock { text-align: center; margin: 8mm 0 7mm 0; }
-.titleblock h1 { font-size: 17.3pt; font-weight: bold; margin: 0 0 14pt 0; }
-.titleblock .sub { font-size: 12pt; font-weight: bold; margin-bottom: 14pt; }
-.titleblock .authors { font-size: 11pt; margin-bottom: 7pt; } .titleblock sup { font-size: 7pt; }
-.titleblock .aff { font-size: 9.5pt; line-height: 1.5; }
-.abstract { margin: 9mm 14mm 8mm 14mm; font-size: 9.2pt; line-height: 1.3; text-indent: 0; }
-/* secciones numeradas como en LaTeX */
-h2 { font-size: 14.4pt; font-weight: bold; margin: 17pt 0 8pt 0; break-after: avoid; text-align: left; counter-increment: sec; counter-reset: sub; }
-h2::before { content: counter(sec) "\\2003"; }
-h3 { font-size: 11pt; font-weight: bold; margin: 12pt 0 5pt 0; break-after: avoid; text-align: left; counter-increment: sub; }
-h3::before { content: counter(sec) "." counter(sub) "\\2003"; }
-h2.unnum { counter-increment: none; counter-reset: none; } h2.unnum::before { content: none; }
-h3.unnum { counter-increment: none; } h3.unnum::before { content: none; }
-/* listas con guion largo */
-ul { list-style: none; margin: 0.3em 0; padding-left: 2.2em; } ul li { position: relative; margin: 0.12em 0; text-align: justify; }
-ul li::before { content: "\\2013"; position: absolute; left: -1.2em; }
-ol { margin: 0.3em 0; padding-left: 2.2em; } ol li { margin: 0.12em 0; }
-/* tablas tipo booktabs con encabezado azul claro y pie "Table N:" arriba */
-.tcap { text-align: center; text-indent: 0; font-size: 9.5pt; margin: 12pt 0 3pt 0; break-after: avoid; counter-increment: tab; }
-.tcap::before { content: "Table " counter(tab) ": "; }
-table.t { border-collapse: collapse; width: auto; max-width: 100%; margin: 3pt auto 10pt auto; font-size: 9pt; page-break-inside: avoid;
-          border-top: 1.2pt solid #000; border-bottom: 1.2pt solid #000; text-align: center; }
-table.t th { background: #d4dafa; padding: 2.5pt 6pt; font-weight: bold; border: none; }
-table.t td { padding: 2.2pt 6pt; border: none; text-align: center; } table.t tr:nth-child(even) td { background: #eef1fd; }
-table.t td:first-child { text-align: left; }
-table.small { font-size: 7.3pt; width: 100%; } table.small td, table.small th { padding: 1.6pt 2.5pt; }
-/* figuras con pie "Fig. N:" abajo */
-figure { margin: 8pt auto; text-align: center; page-break-inside: avoid; counter-increment: fig; } figure img { width: 100%; }
-figcaption { font-size: 9pt; margin-top: 3pt; text-align: center; text-indent: 0; }
-figcaption::before { content: "Fig. " counter(fig) ": "; }
-.dos { display: flex; gap: 8px; align-items: flex-start; } .dos figure { width: 50%; } .dos > div { width: 50%; }
-.dest, .nota { margin: 0.4em 0; text-indent: 1.5em; }
-code { font-family: 'LMMono', 'Liberation Mono', monospace; font-size: 9pt; }
-a { color: #000; text-decoration: none; border: 0.8pt solid #00e5e5; padding: 0 1pt; }
-"""
+# ----------------------------------------------------------------------------------------------------------------------
+# Render DOCX
+# ----------------------------------------------------------------------------------------------------------------------
+FONT = "Times New Roman"
+doc = Document()
+st = doc.styles
+st["Normal"].font.name = FONT; st["Normal"].font.size = Pt(11)
+st["Normal"].element.rPr.rFonts.set(qn("w:eastAsia"), FONT)
+st["Normal"].paragraph_format.space_after = Pt(6); st["Normal"].paragraph_format.line_spacing = 1.15
+for name, size, before, after in [("Heading 1", 15, 16, 6), ("Heading 2", 12.5, 12, 4)]:
+    s = st[name]; s.font.name = FONT; s.font.size = Pt(size); s.font.bold = True; s.font.color.rgb = RGBColor(0, 0, 0)
+    rf = s.element.rPr.rFonts
+    for a_ in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+        if rf.get(qn(a_)) is not None: del rf.attrib[qn(a_)]
+    for a_ in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"): rf.set(qn(a_), FONT)
+    s.paragraph_format.space_before = Pt(before); s.paragraph_format.space_after = Pt(after); s.paragraph_format.keep_with_next = True
+cap = st["Caption"]; cap.font.name = FONT; cap.font.size = Pt(9.5); cap.font.bold = False; cap.font.italic = False; cap.font.color.rgb = RGBColor(0, 0, 0)
+cap.paragraph_format.space_after = Pt(4); cap.paragraph_format.space_before = Pt(2)
+for lst in ("List Bullet", "List Number"):
+    st[lst].font.name = FONT; st[lst].font.size = Pt(11); st[lst].paragraph_format.space_after = Pt(3)
 
-html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Documento de diseño – Práctica 2</title><style>{CSS}</style></head><body>
+sect = doc.sections[0]
+sect.page_width, sect.page_height = Cm(21.59), Cm(27.94)
+for s_ in ("left_margin", "right_margin"): setattr(sect, s_, Cm(2.5))
+sect.top_margin = Cm(2.5); sect.bottom_margin = Cm(2.3)
+TEXT_W = 16.5
+doc.core_properties.title = "Trabajo Práctico 2 – Calidad del aire en India"
+doc.core_properties.author = ", ".join(INTEGRANTES)
+doc.core_properties.subject = "Introducción a la Inteligencia Artificial (3010476)"
 
-<div class="titleblock">
-<h1>Trabajo Práctico 2</h1>
-<div class="sub">Calidad del aire en India: clasificación y agrupamiento del AQI</div>
-<div class="authors">{AUTORES}</div>
-<div class="aff">Universidad Nacional de Colombia, Sede Medellín, Colombia<br>Introducción a la Inteligencia Artificial (3010476) · Grupo {J['grupo']}, Equipo {J['equipo']}</div>
-</div>
 
-<div class="abstract"><b>Abstract.</b> Trabajamos con {J['n_registros']} registros de calidad del aire de 26 ciudades de India para clasificar el AQI en seis categorías (de <i>Good</i> a <i>Severe</i>) y después agrupar los datos sin etiqueta. Armamos ocho versiones del dataset combinando escalado, un 5 % de outliers y balanceo de clases, y en cada una entrenamos árbol de decisión, KNN, SVM y red neuronal; con las mismas versiones, sin la etiqueta, corrimos K-Means y DBSCAN. El F1 macro más alto fue {R.f1.max():.3f} ({R.loc[R.f1.idxmax(), 'modelo']}, caso {int(R.loc[R.f1.idxmax(), 'caso'])}). Balancear las clases fue la decisión de mayor efecto; el escalado importó para SVM y red y no para el árbol; los outliers inyectados casi no movieron los resultados. En no supervisado, K-Means separó aire limpio de contaminado y DBSCAN solo encontró estructura con los datos balanceados. Contamos también un error de preprocesamiento que nos tocó corregir a mitad de camino y que cambió por completo la lectura de los resultados.</div>
+def set_cell_shade(cell, hex_):
+    tcPr = cell._tc.get_or_add_tcPr(); shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto"); shd.set(qn("w:fill"), hex_); tcPr.append(shd)
 
-<h2>0. Lo que nos pasó de entrada</h2>
-<p>Lo primero que nos pegó fue una sorpresa fea. Con el pipeline recién armado, la red neuronal sacaba un F1 de 0.15 en el caso 7 y la SVM se quedaba en 0.43 en el caso 8, mientras el árbol de decisión seguía tranquilo en 0.52 y 0.65. Nos tocó destapar el código para enredarnos con el problema, y no estaba en los modelos: para “limpiar” los outliers recortábamos solo el train, y el test seguía con sus valores crudos. Después de estandarizar, algunas filas de prueba quedaban hasta 98 desviaciones por fuera de lo que el modelo había visto, y en el caso 8 el 40 % de las filas de prueba tenía al menos un valor con |z| &gt; 10. KNN, SVM y redes no fallaban por ser malos, fallaban por un test que no se parecía a su entrenamiento.</p>
-<p>Lo corregimos aplicando a validación y prueba el mismo recorte (con límites aprendidos solo en train) en los 8 casos. De rebote quedó algo que el enunciado pide: el test es idéntico en valores y en registros en todos los casos, así que la figura 1 se puede comparar fila contra fila. Todo lo que sigue sale de esa versión corregida.</p>
-<div class="dest"><b>Lo más importante que vimos:</b> (1) balancear las clases movió el F1 más que cualquier otra decisión (entre {sg(min(ef['BAL'][2]))} y {sg(max(ef['BAL'][2]))} de F1 medio según el modelo); (2) el escalado cambia mucho a SVM y redes y nada al árbol; (3) los outliers que inyectamos movieron el F1 menos de lo que esperábamos (alrededor de ±0.01); (4) en no supervisado, K-Means separa aire “limpio” de aire “contaminado” y DBSCAN solo encuentra estructura cuando el balanceo le densifica los datos.</div>
 
-<h2>1. Dataset: fuente, variables y justificación</h2>
-<h3>1.1 Fuente y por qué lo escogimos</h3>
-<p>Usamos <i>Air Quality Data in India</i> (Kaggle, Rohan Rao, <a href="{DATASET_URL}">enlace</a>), archivo <code>city_day.csv</code>: mediciones diarias de contaminantes en 26 ciudades de India entre 2015 y 2020. Lo elegimos porque (a) la variable objetivo, <code>AQI_Bucket</code>, trae 6 clases ordenadas por severidad; (b) mezcla variables numéricas y categóricas; (c) tiene nulos y valores extremos de verdad, así que el preprocesamiento que pide el enunciado importa en la práctica y no queda de adorno; y (d) los errores tienen costo claro: no es lo mismo decirle a una ciudad que el aire está “Moderate” cuando está “Severe” que al revés.</p>
-<p>Las categorías siguen los rangos del índice de calidad del aire de India (CPCB), que es lo que hay detrás de <code>AQI_Bucket</code>:</p>
-<table class="t"><tr><th>AQI_Bucket</th><th>Good</th><th>Satisfactory</th><th>Moderate</th><th>Poor</th><th>Very Poor</th><th>Severe</th></tr>
-<tr><td>Rango de AQI</td><td>0–50</td><td>51–100</td><td>101–200</td><td>201–300</td><td>301–400</td><td>401–500</td></tr></table>
-<h3>1.2 Descripción de las variables</h3>
-<table class="t">
-<tr><th>Variable</th><th>Tipo</th><th>Uso en el modelo</th></tr>
-<tr><td>City</td><td>Categórica nominal (26 ciudades)</td><td>One-Hot</td></tr>
-<tr><td>Date</td><td>Fecha (2015–2020)</td><td>Se derivan <b>Season</b> (Winter, Summer, Monsoon, PostMonsoon; nominal → One-Hot) y <b>Year</b> (ordinal por orden temporal)</td></tr>
-<tr><td>PM2.5, PM10, NO, NO2, NOx, NH3, CO, SO2, O3, Benzene, Toluene, Xylene</td><td>Numéricas continuas</td><td>Imputación con mediana, recorte IQR, escalado</td></tr>
-<tr><td>AQI</td><td>Numérica</td><td><b>Se excluye</b>: <code>AQI_Bucket</code> se calcula directamente a partir de ella (fuga de información)</td></tr>
-<tr><td>AQI_Bucket</td><td>Objetivo, 6 clases</td><td>Good &lt; Satisfactory &lt; Moderate &lt; Poor &lt; Very Poor &lt; Severe</td></tr>
-</table>
-<h3>1.3 Verificación de requisitos</h3>
-<ul>
-<li>Cédula utilizada: <b>{J['cedula']}</b> → último dígito distinto de cero = {ultimo_dig} → 5000 + {ultimo_dig} × 150 = <b>{J['n_registros']}</b> registros; semilla <b>{J['seed']}</b> (dos últimos dígitos distintos de cero).</li>
-<li>Registros originales: <b>{J['filas_originales']:,}</b>; con etiqueta: <b>{J['filas_etiquetadas']:,}</b>. Subconjunto de trabajo: <b>{J['n_registros']}</b> (≥ 5000 ✔), muestreado al azar con <code>random_state={J['seed']}</code> (distinto de 42 ✔).</li>
-<li>Clases en la variable objetivo: <b>6</b> (≥ 4 ✔). Distribución del subconjunto: {dist_txt}.</li>
-<li>Características numéricas (12) y categóricas (City, Season, Year) ✔.</li>
-<li>Partición estratificada: train {J['tamanos_split']['tr']}, validación {J['tamanos_split']['va']}, prueba {J['tamanos_split']['te']} (70/15/15).</li>
-</ul>
+def set_cell_borders(cell, **kw):
+    tcPr = cell._tc.get_or_add_tcPr(); b = tcPr.find(qn("w:tcBorders"))
+    if b is None:
+        b = OxmlElement("w:tcBorders"); tcPr.append(b)
+    for edge, (val, sz) in kw.items():
+        e = OxmlElement(f"w:{edge}"); e.set(qn("w:val"), val); e.set(qn("w:sz"), str(sz)); e.set(qn("w:color"), "000000"); b.append(e)
 
-<h2>2. Preprocesamiento</h2>
-{fig('diagrama_pipeline.png', 'Figura A. Flujo del preprocesamiento. Todo lo que “aprende” algo de los datos se ajusta solo con train.')}
-<h3>2.1 Análisis exploratorio</h3>
-<p>Nulos: Xylene es la peor ({nul['Xylene']:.1f} %), seguida de PM10 ({nul['PM10']:.1f} %), NH3 ({nul['NH3']:.1f} %) y Toluene ({nul['Toluene']:.1f} %); el resto está por debajo del 15 %. Imputamos con la <b>mediana</b> (calculada en train) porque los contaminantes tienen colas muy pesadas y la media se la comen los picos. Con Xylene la imputación es discutible: más de la mitad de la columna es mediana. La dejamos para respetar el enunciado, pero es una limitación que anotamos al final.</p>
-<p>Correlaciones altas (|r| &gt; 0.8): {', '.join(f'{k} ({v})' for k, v in J['correlaciones_altas'].items())}. Es esperable: PM2.5 está contenido en PM10, y NOx incluye al NO. Para árboles no estorba; para KNN y SVM significa que esa información pesa doble en la distancia.</p>
-<div class="dos">{fig('eda_clases.png', 'Figura B. Distribución de clases del subconjunto.')}{fig('eda_correlacion.png', 'Figura C. Matriz de correlación.')}</div>
-<h3>2.2 Decisiones y justificación</h3>
-<ul>
-<li><b>Conversión de categóricas (CC):</b> One-Hot para <code>City</code> y <code>Season</code> porque no tienen un orden natural (Medellín no es “mayor” que Bogotá, ni el monzón mayor que el invierno). Codificación ordinal para <code>Year</code>, que sí tiene orden temporal. Esta es la decisión más discutible del dataset: casi no trae ordinales de verdad y <code>Year</code> fue la opción menos forzada.</li>
-<li><b>Escalado (ED):</b> <code>StandardScaler</code>, con fit solo en train. Lo preferimos a MinMax porque con colas pesadas un solo valor extremo comprime a todos los demás en un rango minúsculo.</li>
-<li><b>Outliers:</b> detección con IQR (factor 1.5) sobre las 12 variables numéricas, con límites calculados en train. Con ese criterio el <b>{J['outliers_train_natural_filas_pct']} %</b> de las filas de train tiene al menos un valor atípico (Xylene {J['outliers_por_variable_pct']['Xylene']} %, Toluene {J['outliers_por_variable_pct']['Toluene']} %), así que <i>eliminarlos</i> habría botado más de la mitad de los datos. Por eso <b>“sin outliers” = recortar (winsorizing) a los límites IQR</b>. <b>“Con outliers”</b> = al train ya recortado le inyectamos sintéticamente exactamente el 5 % de filas con un valor por encima del límite superior en una variable numérica al azar (entre 1.5 y 4 IQR por encima): {casos_tr['3']['outliers']['n_inyectados']} filas en los casos 3 y 7 (de {casos_tr['3']['n_train']}) y {casos_tr['4']['outliers']['n_inyectados']} en los casos 4 y 8 (de {casos_tr['4']['n_train']}). Validación y prueba reciben siempre el recorte con los límites de train.</li>
-<li><b>Desbalanceado:</b> submuestreo del train hasta que la clase mayoritaria (Moderate) sea ≈70 % y las otras cinco queden iguales ({casos_tr['1']['dist_train']}). Quedan {n_train_unb} filas de train.</li>
-<li><b>Balanceado:</b> SMOTE sobre el train natural, hasta igualar las 6 clases a {max(casos_tr['2']['dist_train'].values())} cada una ({n_train_bal} filas). Elegimos SMOTE porque interpola entre vecinos reales en vez de repetir filas, y se aplica en espacio estandarizado temporal para que las distancias no las mande CO o PM10 por tener unidades grandes. Las dummies se redondean a 0/1 después.</li>
-<li><b>Reproducibilidad:</b> el mismo <code>random_state={J['seed']}</code> en la muestra, la partición, los modelos, SMOTE, la inyección de outliers y las inicializaciones de la red. Corrimos el notebook completo dos veces y obtuvimos exactamente las mismas métricas.</li>
-</ul>
-<div class="nota"><b>Cosa a tener en cuenta:</b> “desbalanceado” y “balanceado” no solo cambian la proporción de clases, también el tamaño del train ({n_train_unb} vs {n_train_bal} filas). Parte de la mejora que atribuimos al balanceo puede venir de tener más filas (sintéticas) para entrenar.</div>
 
-<h2>3. Aprendizaje supervisado</h2>
-<h3>3.1 Modelos y configuración</h3>
-<table class="t">
-<tr><th>Técnica</th><th>Configuración</th></tr>
-<tr><td>Árbol de decisión</td><td>Se probaron Gini y Entropía con max_depth ∈ {{2,3,4,5,6,8,10,12,15,20}}; se elige la mejor combinación por F1 macro en validación. En los 8 casos ganó Gini (profundidad 5 en la mayoría; 10 en los casos balanceados sin outliers, 2 y 6).</td></tr>
-<tr><td>KNN</td><td>k impar entre 1 y 25 elegido por accuracy medio de validación cruzada de 5 folds (k elegido por caso: {', '.join(str(J['knn_k'][str(c)]) for c in range(1, 9))}).</td></tr>
-<tr><td>SVM</td><td>Kernel RBF, C = 1, gamma = “scale”. Para las curvas ROC/PR se usan los puntajes de <code>decision_function</code> (no son probabilidades calibradas).</td></tr>
-<tr><td>Red neuronal (MLP)</td><td>Dense(64, ReLU, L2 1e-3) → Dropout 0.3 → Dense(32, ReLU, L2 1e-3) → Dropout 0.3 → Dense(6, softmax). Adam, pérdida <code>categorical_crossentropy</code> con etiquetas one-hot (<code>to_categorical</code>), lotes de 64, hasta 200 épocas, con el conjunto de validación en <code>validation_data</code>. Regularización y callback como en el taller 8 de clase: L2, Dropout y <code>EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)</code>. Paró entre {min(nn_ep.values())} y {max(nn_ep.values())} épocas según el caso.</td></tr>
-</table>
-{fig('diagrama_red.png', 'Figura Q. Arquitectura de la red neuronal (MLP) usada en los 8 casos.')}
-<p>Configurar la red fue cacharrear: arrancamos con una arquitectura pequeña y le fuimos sumando regularización hasta que las curvas de train y validación dejaron de separarse. Métricas: accuracy y precision/recall/F1 <b>macro</b> (promedio simple por clase), porque queremos que Severe, que es una clase pequeña, pese lo mismo que Moderate.</p>
+def set_cell_margins(table, top=30, bottom=30, left=60, right=60):
+    tblPr = table._tbl.tblPr; m = OxmlElement("w:tblCellMar")
+    for k, v in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
+        e = OxmlElement(f"w:{k}"); e.set(qn("w:w"), str(v)); e.set(qn("w:type"), "dxa"); m.append(e)
+    tblPr.append(m)
 
-<h3>3.2 Resultados (Figura 1 del enunciado)</h3>
-{fig1_html()}
-<p style="font-size:8.5pt;color:#555">ED = escalado; CC siempre aplicada. Métricas sobre el mismo conjunto de prueba ({J['tamanos_split']['te']} registros) en los 8 casos. En negrita, el F1 macro.</p>
-<h3>3.3 Gráficas pedidas</h3>
-<div class="dos">{fig('f1_max_algoritmo.png', 'Figura D. F1 máximo por algoritmo.')}{fig('f1_medio_ed.png', 'Figura E. F1 medio por escalado y algoritmo.')}</div>
-<div class="dos">{fig('f1_medio_outliers.png', 'Figura F. F1 medio por manejo de outliers y algoritmo.')}{fig('f1_medio_balanceo.png', 'Figura G. F1 medio por balanceo y algoritmo.')}</div>
-<p><b>Efecto medio de cada decisión sobre el F1 (promedio de los 4 casos con el factor en SI menos el promedio de los 4 en NO):</b></p>
-{efectos_html()}
 
-<h3>Patrones generales</h3>
-<ul>
-<li><b>Balanceo:</b> es la decisión que más movió el F1 en los cuatro modelos ({', '.join(f"{m} {sg(ef['BAL'][2][m])}" for m in MODELOS)}).</li>
-<li><b>Escalado:</b> decisivo para SVM ({sg(ef['ED'][2]['SVM'])}) y red ({sg(ef['ED'][2]['Redes Neuronales'])}), irrelevante para el árbol ({sg(ef['ED'][2]['Árboles'])}) y mixto para KNN ({sg(ef['ED'][2]['KNN'])}).</li>
-<li><b>Outliers:</b> efecto pequeño en todos ({sg(min(ef['OUT'][2]))} a {sg(max(ef['OUT'][2]))}).</li>
-<li><b>Ranking por F1 máximo:</b> {' > '.join(f"{m} ({v[0]:.3f})" for m, v in sorted(mx.items(), key=lambda kv: -kv[1][0]))}.</li>
-</ul>
+def add_hyperlink(par, url, text, size=None):
+    rid = par.part.relate_to(url, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", is_external=True)
+    h = OxmlElement("w:hyperlink"); h.set(qn("r:id"), rid)
+    r = OxmlElement("w:r"); rPr = OxmlElement("w:rPr")
+    c = OxmlElement("w:color"); c.set(qn("w:val"), "0563C1"); rPr.append(c)
+    u = OxmlElement("w:u"); u.set(qn("w:val"), "single"); rPr.append(u)
+    if size:
+        sz = OxmlElement("w:sz"); sz.set(qn("w:val"), str(int(size * 2))); rPr.append(sz)
+    r.append(rPr); t = OxmlElement("w:t"); t.text = text; t.set(qn("xml:space"), "preserve"); r.append(t); h.append(r); par._p.append(h)
 
-<h3>3.4 Análisis de resultados</h3>
-<p><b>Quién gana.</b> El árbol tiene el F1 máximo general ({fmt(mx['Árboles'][0])}, caso {mx['Árboles'][1]}), seguido de SVM ({fmt(mx['SVM'][0])}, caso {mx['SVM'][1]}), redes ({fmt(mx['Redes Neuronales'][0])}, caso {mx['Redes Neuronales'][1]}) y KNN ({fmt(mx['KNN'][0])}, caso {mx['KNN'][1]}). Pero la ventaja del árbol es corta y se desvanece en el caso 8 (todo el preprocesamiento aplicado): árbol {fmt(c8['Árboles'])}, SVM {fmt(c8['SVM'])}, red {fmt(c8['Redes Neuronales'])}, KNN {fmt(c8['KNN'])}. El árbol gana más que todo cuando los demás están mal preparados, y esa fue la lección del escalado.</p>
-<p><b>Sensibilidad a la escala.</b> El árbol dio <i>exactamente</i> el mismo resultado con y sin escalado (casos 1=5, 2=6, 3=7, 4=8): divide por umbrales de una variable a la vez y escalar solo mueve el umbral de sitio. SVM y red sí se benefician ({sg(ef['ED'][2]['SVM'])} y {sg(ef['ED'][2]['Redes Neuronales'])} de F1 medio): con unidades crudas, PM10 (cientos) y CO (unidades) no pesan igual en el kernel RBF ni en los pesos de la red. KNN fue la excepción ({sg(ef['ED'][2]['KNN'])}): escalar le ayuda en los casos balanceados y le estorba en los desbalanceados, y no encontramos una explicación que podamos comprobar, así que no la damos por hecha.</p>
-<p><b>Outliers.</b> El efecto fue pequeño en los 4 modelos (entre {sg(min(ef['OUT'][2]))} y {sg(max(ef['OUT'][2]))}). Nos esperábamos más, sobre todo en SVM, KNN y redes. Creemos que pesan dos cosas: inyectamos un 5 % moderado (1.5 a 4 IQR por encima del límite) y el test va recortado, de modo que los modelos nunca ven en evaluación los valores que se inyectaron en entrenamiento. Es decir, medimos cuánto estorba entrenar con ruido, no cuánto estorba recibir ruido al predecir. Esto último sí lo vivimos sin querer en la sección 1 y fue mucho más destructivo.</p>
-<p><b>Desbalance y por qué el accuracy engaña.</b> Balancear fue la decisión con más efecto ({sg(ef['BAL'][2]['Árboles'])} en árbol, {sg(ef['BAL'][2]['KNN'])} en KNN, {sg(ef['BAL'][2]['SVM'])} en SVM y {sg(ef['BAL'][2]['Redes Neuronales'])} en redes). Con el train dominado por Moderate (70 %), los modelos aprenden que acertar “Moderate” casi siempre paga, y las clases chicas (Good, Severe) quedan mal atendidas. Un clasificador tonto que dijera siempre “Moderate” tendría 70 % de accuracy dentro de ese train sin haber aprendido nada. Aquí hay que ser honestos: como el test conserva la distribución natural (Moderate es ~36 %), el accuracy no se infló tanto como pasaría con un test 70/30; el engaño se ve mejor mirando el recall por clase que el accuracy global. Por eso reportamos F1 macro y no accuracy como métrica principal.</p>
-<p><b>Costo de los errores y métrica que priorizamos.</b> En calidad del aire un falso negativo (decir “Moderate” cuando el aire está en “Severe”) deja a la gente sin alerta; un falso positivo (alertar de más) genera molestia y costo, pero no daño directo a la salud. Por eso, entre las métricas, miramos primero el <b>recall de las clases altas (Poor, Very Poor, Severe)</b> y usamos <b>F1 macro</b> como resumen, porque no deja que Moderate y Satisfactory tapen los fallos en las clases raras.</p>
-{rep_html()}
-<p style="font-size:8.5pt;color:#555">Recall / F1 por clase, caso 8, conjunto de prueba. El recall de Severe fue {', '.join(f'{m} {sev[m]:.2f}' for m in MODELOS)}.</p>
-<h3>3.5 Matrices de confusión y curvas ROC / Precision-Recall (caso 8)</h3>
-{fig('matrices_confusion_caso8.png', 'Figura H. Matrices de confusión de las 4 técnicas en el caso 8.')}
-{fig('roc_pr_caso8.png', 'Figura I. Curvas ROC y Precision-Recall (promedio micro) del caso 8.')}
-<p>El AUC macro (uno contra todos) del caso 8 fue: red {roc['Redes Neuronales']['auc_macro']:.3f}, SVM {roc['SVM']['auc_macro']:.3f}, árbol {roc['Árboles']['auc_macro']:.3f} y KNN {roc['KNN']['auc_macro']:.3f}; el AUC-PR micro: red {roc['Redes Neuronales']['auc_pr_micro']:.3f}, SVM {roc['SVM']['auc_pr_micro']:.3f}, árbol {roc['Árboles']['auc_pr_micro']:.3f}, KNN {roc['KNN']['auc_pr_micro']:.3f}. Aunque el árbol empata en F1 con SVM y red, su curva es peor: un árbol de profundidad 5 solo reparte unas pocas probabilidades distintas (cada hoja da un valor), así que la curva sale escalonada y pierde resolución para ordenar casos. KNN con k=1 es el caso extremo: sus “probabilidades” son 0 o 1 y por eso tiene el AUC ROC más bajo ({roc['KNN']['auc_macro']:.3f}). Su AUC-PR ({roc['KNN']['auc_pr_micro']:.3f}) sale más alta que la del árbol, pero no la leemos como mejor: con tan pocos umbrales la curva tiene muy pocos puntos y el área por trapecio (el cálculo que vimos en el taller 7) la favorece, así que para KNN nos fiamos más del AUC ROC y del F1. SVM y red ordenan mejor los casos. Ojo: los puntajes de SVM no son probabilidades calibradas, por eso comparamos las curvas como ranking y no como probabilidad.</p>
 
-<h3>3.6 Visualización por técnica</h3>
-<p><b>Árbol de decisión.</b> Las variables más importantes en el caso 8 son: {tree_top8}.</p>
-{fig('arbol_caso8.png', 'Figura J. Árbol (caso 8): importancia de características, max_depth vs accuracy (Gini vs Entropía) y primeros niveles del árbol con Gini. Los 8 casos están en salidas/arbol_casoN.png y las reglas en salidas/reglas_arbol_casoN.txt.')}
-<p><b>Lectura en el dominio.</b> Que PM2.5 y PM10 manden tiene sentido: el AQI indio se calcula a partir de los subíndices de cada contaminante y el material particulado suele ser el que más pesa. La regla raíz parte por PM10 por debajo o por encima del promedio; con PM10 muy bajo y CO bajo el árbol cae en <i>Good</i>; con PM2.5 alto (&gt; 1.5 desviaciones) cae en <i>Very Poor</i>/<i>Severe</i>. Un hallazgo menos cómodo: aparece <code>City_Ahmedabad</code> como la tercera variable más importante. El árbol usa esa ciudad como atajo para desempatar, porque Ahmedabad tiene niveles persistentemente altos. Es útil para predecir, pero es información de lugar y no de contaminación, y no deberíamos creer que “estar en Ahmedabad” causa un AQI peor.</p>
-<p><b>Subajuste y sobreajuste.</b> La exactitud de entrenamiento sube hasta ~1.0 al crecer max_depth, mientras la de validación se aplana pasada la profundidad 5; ahí está el sobreajuste. Con profundidad 2–3 hay subajuste (ambas bajas). Gini y Entropía dieron curvas casi idénticas y Gini ganó en los 8 casos, así que usamos Gini.</p>
-<p><b>KNN.</b> En los casos balanceados la validación cruzada eligió k = {', '.join(map(str, k_bal))} (siempre 1) y con k=1 daba un accuracy de ~0.86, pero en prueba el accuracy fue ~0.68. Es un espejismo de SMOTE: los puntos sintéticos son interpolaciones de puntos reales, y al repartirse entre folds, un punto de validación tiene casi un gemelo en entrenamiento. Es una limitación que dejamos escrita: para los casos balanceados el k “elegido” sale optimista.</p>
-{fig('knn_caso8.png', 'Figura K. KNN (caso 8): k vs accuracy (CV 5 folds) y vecinos de 3 puntos de prueba en PCA 2D (los vecinos se calculan en el espacio completo; PCA solo dibuja).')}
-<p><b>SVM.</b> Las regiones son franjas curvas que se ordenan de izquierda a derecha (aire más limpio → más contaminado), y se solapan bastante en el centro, que es donde viven Moderate y Poor. Con dos componentes se pierde información, así que el solapamiento del dibujo exagera el del modelo real.</p>
-{fig('svm_regiones_caso8.png', 'Figura L. Regiones de decisión de la SVM en PCA 2D (caso 8). Se reentrena una SVM sobre la proyección solo para poder dibujar; el modelo evaluado usa las variables completas.', '70%')}
-<p><b>Red neuronal.</b> En el caso 8 la validación se aplana temprano y EarlyStopping paró en la época {nn_ep['8']} restaurando los mejores pesos; la brecha entre train y validación es moderada gracias al Dropout y la regularización L2.</p>
-{fig('nn_curvas_caso8.png', 'Figura M. Curvas de pérdida y accuracy de la red (caso 8).')}
+TOKEN = re.compile(r"(\*\*.+?\*\*|\*[^*\s][^*]*?\*|`[^`]+`|\^[^^]+\^|==.+?==|<<[^|>]+\|[^>]+>>)")
 
-<h3>3.7 Tres datos de prueba (caso 8)</h3>
-{df_html(T3[T3.caso == 8].drop(columns="caso"))}
-<p style="font-size:8.5pt;color:#555">Los mismos 3 registros de prueba en los 8 casos (todos los casos están en <code>salidas/tres_datos_prueba_supervisado.csv</code>). Tres ejemplos sirven para ilustrar, no para concluir nada: la evidencia es la tabla de la figura 1.</p>
 
-<h3>3.8 Conclusiones del módulo supervisado</h3>
-<ul>
-<li>Con buen preprocesamiento (caso 8) árbol, SVM y red quedan parecidos en F1 (≈{fmt(min(c8[['Árboles','SVM','Redes Neuronales']]))}–{fmt(max(c8[['Árboles','SVM','Redes Neuronales']]))}); KNN queda un poco atrás. La diferencia grande no está entre algoritmos sino entre prepararlos bien o mal.</li>
-<li>El árbol es el más robusto al preprocesamiento (no depende del escalado y casi no reacciona a los outliers) y el más fácil de explicar. SVM y red necesitan escalado y rinden mejor ordenando casos (ROC/PR).</li>
-<li>Para este dominio, nos quedaríamos con un SVM o red entrenados sobre datos escalados y balanceados si importa el ranking de riesgo, y con el árbol si importa explicarle la regla a alguien. En ambos casos vigilaríamos el recall de Severe y no el accuracy.</li>
-</ul>
+def runs(par, text, size=None, bold=False):
+    """Escribe texto con marcado en línea dentro de un párrafo."""
+    text = resolver(text)
+    for tok in TOKEN.split(text):
+        if not tok:
+            continue
+        if tok.startswith("<<"):
+            url, txt = tok[2:-2].split("|", 1); add_hyperlink(par, url, txt, size); continue
+        r = None
+        if tok.startswith("**"): r = par.add_run(tok[2:-2]); r.bold = True
+        elif tok.startswith("==") : r = par.add_run(tok[2:-2]); r.font.highlight_color = WD_COLOR_INDEX.YELLOW; r.bold = bold
+        elif tok.startswith("`"): r = par.add_run(tok[1:-1]); r.font.name = "Courier New"; r.font.size = Pt((size or 11) - 1); r.bold = bold; continue
+        elif tok.startswith("^"): r = par.add_run(tok[1:-1]); r.font.superscript = True
+        elif tok.startswith("*") and tok.endswith("*") and len(tok) > 2: r = par.add_run(tok[1:-1]); r.italic = True; r.bold = bold
+        else: r = par.add_run(tok); r.bold = bold
+        if size and r is not None: r.font.size = Pt(size)
 
-<h2>4. Aprendizaje no supervisado</h2>
-<h3>4.1 Construcción de los casos</h3>
-<p>Usamos el mismo dataset sin la variable objetivo. Las 8 versiones de la figura 2 son exactamente los mismos train del módulo supervisado (mismos registros, mismo recorte/inyección de outliers, mismo balanceo, One-Hot y escalado) con la etiqueta descartada. Así, “balanceado” significa que los datos incluyen los puntos sintéticos de SMOTE, y “desbalanceado”, el submuestreo con 70 % de Moderate. La etiqueta original se usó únicamente para la validación externa (cruzar cada cluster con la clase real) y para interpretar los clusters, nunca para entrenar.</p>
-<h3>4.2 Configuración</h3>
-<ul>
-<li><b>K-Means:</b> inicialización k-means++, <code>n_init=10</code>, <code>random_state={J['seed']}</code>, K de 2 a 10. Se reportan inertia (codo) y silhouette (calculado con muestra de 3000 puntos para que no se demore); el K elegido es el de mayor silhouette, y el K del codo se muestra al lado.</li>
-<li><b>DBSCAN:</b> MinPts = 2 × número de características (= {2 * casos_tr['1']['n_features']}, con {casos_tr['1']['n_features']} columnas tras el One-Hot). ε se toma del codo de la curva de k-distancia (k = MinPts). Silhouette sin contar el ruido (necesita ≥ 2 clusters).</li>
-</ul>
-<div class="nota"><b>Ajuste que tuvimos que hacer:</b> con el ε del codo, DBSCAN dejaba todos los datos en <b>un solo cluster</b> en varios casos (silhouette no calculable). Cuando pasó, exploramos 12 valores de ε entre 0.3 y 0.95 veces el del codo y nos quedamos con el de mayor silhouette que diera ≥ 2 clusters y ≤ 50 % de ruido. La tabla muestra ambos ε. Si ningún ε cumplía, dejamos el del codo, y en esos casos no hay silhouette.</div>
-<h3>4.3 Resultados (Figura 3 del enunciado)</h3>
-{fig3_html()}
-{fig('silhouette_por_caso.png', 'Figura N. Silhouette por caso para K-Means (izquierda) y DBSCAN (derecha; 0 = no calculable).')}
-{fig('kmeans_dbscan_seleccion_parametros.png', 'Figura O. Selección de parámetros por caso: codo (inertia), silhouette vs K y gráfico de k-distancia (línea roja: ε del codo; verde punteada: ε usado).', '72%')}
-<h3>4.4 Análisis</h3>
-<p><b>K-Means.</b> El silhouette eligió K=2 en los 8 casos, mientras el codo sugirió entre {int(F3['K codo'].min())} y {int(F3['K codo'].max())}. Esa diferencia dice algo: las 6 clases del AQI son más un continuo (cada clase es un tramo de la misma escala) que 6 grupos separados, así que el único corte limpio es “aire más limpio vs más contaminado”. Cruzando con la etiqueta (caso 8), el cluster 1 junta casi todo Good, Satisfactory y la mayor parte de Moderate, y el cluster 0 junta la mayoría de Poor, Very Poor y Severe. Sí tiene sentido para el dominio, aunque con K=2 no se pueden recuperar las 6 clases.</p>
-{ct_html('kmeans')}
-{ct_html('dbscan')}
-<p style="font-size:8.5pt;color:#555">Cruces de las Tablas anteriores (caso 8). Solo para interpretar; la etiqueta no entró al entrenamiento.</p>
-<p><b>Efecto del escalado.</b> La inertia no se puede comparar entre escalado y no escalado: sin escalar es del orden de millones ({km1['KM inertia']:,.0f} en el caso 1) y escalada de decenas de miles ({km5['KM inertia']:,.0f} en el caso 5), simplemente por las unidades. El silhouette sin escalar fue más alto en promedio ({sil_ed_no:.3f} vs {sil_ed_si:.3f}), pero no lo leemos como “mejor”: sin escalar, las variables de magnitud grande (PM10, NOx) mandan en la distancia euclidiana y K-Means termina partiendo por casi una sola variable, lo cual hace fácil que el silhouette salga alto.</p>
-<p><b>Efecto de los outliers.</b> Inyectar el 5 % subió la inertia ~{out_pct_km:.0f} % sin escalar (caso 1→3) y ~{out_pct_km_ed:.0f} % con escalado (caso 5→7), mientras el silhouette casi no se movió. Es lo esperado: la inertia suma distancias al cuadrado y unos pocos puntos lejanos la inflan, pero el centroide se corre poco con solo 5 %.</p>
-<p><b>Efecto del balanceo.</b> El silhouette promedio subió de {sil_bal_no:.3f} a {sil_bal_si:.3f} con los datos balanceados. Ojo con leerlo como una mejora real: SMOTE rellena el espacio entre puntos reales con puntos interpolados, lo que hace los grupos más compactos y el silhouette se infla.</p>
-<p><b>DBSCAN.</b> En los 4 casos desbalanceados dio <b>un solo cluster</b> (ruido ≤ {db_unbal['DB ruido %'].max():.1f} %): con {n_train_unb} puntos en {casos_tr['1']['n_features']} dimensiones y MinPts = {2 * casos_tr['1']['n_features']}, la densidad es tan baja que hace falta un ε grande para que haya núcleos, y a ese ε todo se conecta. En los casos balanceados, que tienen cuatro veces más puntos, sí aparecieron estructuras: {int(db_bal['DB clusters'].min())}–{int(db_bal['DB clusters'].max())} clusters, con {db_bal['DB ruido %'].min():.0f}–{db_bal['DB ruido %'].max():.0f} % de ruido. Con escalado los clusters fueron más ({int(F3.loc[(F3.ED=='SI') & (F3.Balanceo=='SI'), 'DB clusters'].max())}) y más ruido. El cruce con la etiqueta del caso 8 muestra qué encontró: un cluster grande de aire limpio (Good y Satisfactory), bolsillos densos dominados por Severe, y el ruido concentra Moderate y Poor, la zona intermedia donde no hay vacíos de densidad. Esto confirma lo que sospechábamos: DBSCAN encuentra los extremos, pero la franja del medio es un continuo y no tiene “bordes” que detectar.</p>
-<h3>K-Means vs DBSCAN</h3>
-<table class="t">
-<tr><th></th><th>K-Means</th><th>DBSCAN</th></tr>
-<tr><td>Forma de los clusters</td><td>Esféricos/convexos (distancia al centroide)</td><td>Arbitraria; en el PCA se ven manchas alargadas</td></tr>
-<tr><td>Definir K</td><td>Hay que fijarlo (codo/silhouette); aquí dio 2</td><td>No se define K, pero hay que acertar con ε y MinPts (más delicado que K)</td></tr>
-<tr><td>Ruido y outliers</td><td>Todo punto cae en algún cluster; los outliers arrastran la inertia</td><td>Marca el ruido explícitamente; en balanceados fue 15–43 %</td></tr>
-<tr><td>Densidades variables</td><td>Indiferente a la densidad, solo mira distancia</td><td>Sufre: un solo ε no sirve para zonas densas y dispersas a la vez (aquí, 1 cluster o mucho ruido)</td></tr>
-<tr><td>Alta dimensión ({casos_tr['1']['n_features']} columnas)</td><td>Aguanta mejor</td><td>La distancia pierde contraste y la densidad se diluye</td></tr>
-</table>
-<h3>4.5 Visualización de clusters en 2D (PCA)</h3>
-{fig('clusters_caso8.png', 'Figura P. Caso 8: K-Means (K elegido, centroides en rojo) y DBSCAN (ruido en gris). Los 8 casos están en salidas/clusters_casoN.png.')}
-<p>Se ve lo que cuentan las tablas: K-Means corta la nube en dos mitades por el eje principal (PC1, que básicamente ordena de aire más limpio a más contaminado), y DBSCAN recoge las zonas densas y deja en gris la parte intermedia.</p>
-<h3>4.6 Tres datos de prueba (caso 8)</h3>
-{df_html(T3u[T3u.caso == 8].drop(columns="caso"))}
-<p style="font-size:8.5pt;color:#555">K-Means asigna al centroide más cercano; DBSCAN no tiene <code>predict</code>, así que usamos el punto núcleo más cercano a distancia ≤ ε, o ruido si queda más lejos.</p>
-<h3>4.7 Conclusiones del módulo no supervisado</h3>
-<ul>
-<li>Los datos no traen 6 grupos naturales: el AQI es una escala continua dividida por umbrales. El agrupamiento recupera bien el eje “limpio ↔ contaminado” y mal las clases intermedias.</li>
-<li>K-Means es estable y fácil de interpretar pero obliga a partir todo; DBSCAN es más honesto con el ruido pero muy sensible a ε, MinPts y al tamaño del conjunto.</li>
-<li>Las comparaciones entre casos con y sin escalado o con y sin balanceo hay que leerlas con cuidado: la inertia depende de las unidades y SMOTE infla la cohesión.</li>
-</ul>
 
-<h2>5. Conclusiones generales y limitaciones</h2>
-<ul>
-<li>Lo que más movió los resultados fue lo menos vistoso: cómo prepararon los datos (balanceo y escalado) y que el test se tratara igual que el train. Ningún algoritmo ganó por sí solo.</li>
-<li>El mismo patrón se repite en las dos mitades: el árbol y K-Means son robustos y explicables; SVM, red y DBSCAN rinden o fallan según el preprocesamiento.</li>
-<li><b>Limitaciones.</b> (1) Una sola corrida por caso, sin repeticiones con varias semillas: las diferencias de ~0.01 no son concluyentes. (2) El tamaño de train cambia entre balanceado y desbalanceado. (3) Xylene tiene {nul['Xylene']:.0f} % de nulos imputados con mediana. (4) El k de KNN en casos balanceados sale optimista por SMOTE. (5) <code>Year</code> como variable ordinal es una decisión discutible. (6) El test va recortado con límites de train, así que no mide el desempeño ante outliers reales. (7) El ajuste de ε en DBSCAN es una decisión nuestra, descrita en 5.2.</li>
-</ul>
+def para(text, style=None, align=WD_ALIGN_PARAGRAPH.JUSTIFY, size=None, after=None, before=None, keep=False, bold=False, indent=None):
+    par = doc.add_paragraph(style=style); par.alignment = align
+    if after is not None: par.paragraph_format.space_after = Pt(after)
+    if before is not None: par.paragraph_format.space_before = Pt(before)
+    if keep: par.paragraph_format.keep_with_next = True
+    if indent is not None: par.paragraph_format.left_indent = Cm(indent)
+    runs(par, text, size, bold)
+    return par
 
-<h2>6. Qué sale de las clases y qué viene del enunciado</h2>
-<p>Para la sustentación nos sirvió dejar claro de dónde sale cada herramienta. Todo lo que está en la columna de clase aparece en las diapositivas o en los talleres.</p>
-<table class="t">
-<tr><th>Tema</th><th>Qué usamos</th><th>Dónde se vio</th></tr>
-<tr><td>Partición de datos</td><td>Train 70 % / validación 15 % / prueba 15 %; la validación decide hiperparámetros y el test se toca al final</td><td>Clase de redes neuronales: conjuntos de entrenamiento, validación y prueba</td></tr>
-<tr><td>Escalado</td><td>StandardScaler (ajustado en train)</td><td>Taller 8 (StandardScaler); clase de K-Means (Min-Max)</td></tr>
-<tr><td>Árboles</td><td><code>DecisionTreeClassifier</code>, Gini vs Entropía, <code>max_depth</code>, <code>feature_importances_</code>, <code>plot_tree</code></td><td>Clase de árboles de decisión</td></tr>
-<tr><td>Métricas</td><td>Accuracy, precision, recall, F1 macro, matriz de confusión, ROC/AUC y Precision-Recall/AUC-PR en One-vs-Rest con promedio micro/macro</td><td>Clase de métricas; taller 7 (<code>auc(recall, precision)</code>)</td></tr>
-<tr><td>Red neuronal</td><td>Dense, ReLU, softmax, entropía cruzada categórica con etiquetas one-hot, Adam, L2, Dropout, EarlyStopping</td><td>Clase de redes neuronales; taller 8</td></tr>
-<tr><td>K-Means</td><td>Inicialización k-means++, codo con SSE (inertia), silhouette, escalado previo</td><td>Clase de K-Means; taller 7</td></tr>
-<tr><td>DBSCAN</td><td>ε con la curva de k-distancia, MinPts = 2 × nº de características, silhouette sin ruido</td><td>Clase de DBSCAN; taller 7</td></tr>
-</table>
-<p><b>Lo que no está en el material de clase que recibimos</b> y por qué lo usamos: <b>KNN</b> y <b>SVM</b> (el enunciado los exige; la SVM va con kernel RBF y el k de KNN sale de validación cruzada de 5 folds, como pide el enunciado), <b>SMOTE</b> y el submuestreo para el balanceo, el <b>recorte por IQR</b> y la <b>PCA para graficar</b> (los nombra el enunciado) y la búsqueda de un ε menor en DBSCAN cuando el del codo deja un solo cluster (ajuste nuestro, descrito en 5.2). No usamos <code>BatchNormalization</code>, <code>ReduceLROnPlateau</code> ni métricas de validación externa como ARI, porque no se vieron en clase.</p>
 
-<h2>7. Reproducibilidad y cómo ejecutar</h2>
-<ol>
-<li>Abrir <code>practica2.ipynb</code> en Google Colab y subir <code>city_day.csv</code> (o dejar que <code>kagglehub</code> lo descargue).</li>
-<li>Editar solo la celda de configuración (<code>CEDULA</code>, <code>GRUPO</code>, <code>EQUIPO</code>); el tamaño y la semilla se derivan solos.</li>
-<li><i>Entorno → Ejecutar todo</i>. Al final se genera <code>salidas.zip</code> con todas las tablas y figuras de este documento.</li>
-</ol>
+def fit_pic(run_par, path, width_cm, max_h_cm=19.5):
+    from PIL import Image
+    w, h = Image.open(path).size
+    wcm = min(width_cm, max_h_cm * w / h)
+    run_par.add_run().add_picture(path, width=Cm(wcm))
 
-<h2>8. Enlace al video (pitch)</h2>
-<p>Video de sustentación (máx. 5 min, todos los integrantes participan): <a href="{VIDEO_URL}">{VIDEO_URL}</a></p>
-<p>Conjunto de datos original: <a href="{DATASET_URL}">{DATASET_URL}</a></p>
 
-{ANEXO}
-</body></html>"""
+def caption(text, kind, n):
+    c = doc.add_paragraph(style="Caption"); c.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = c.add_run(f"{kind} {n}. "); r.bold = True
+    runs(c, text, 9.5)
+    return c
 
-# --- Posprocesado: numeración automática (CSS), "Fig. N" / "Table N" como en el PDF de referencia ---
-html = re.sub(r"<h([23])>(?:\d+(?:\.\d+)*\.?\s+)", r"<h\1>", html)                  # quita números escritos a mano
-html = html.replace("<h2>Anexo", '<h2 class="unnum">Anexo')
-html = re.sub(r"<h3>([AB]\.\d)", r'<h3 class="unnum">\1', html)
-html = re.sub(r"(<figcaption>)Figura [A-Z]\. ", r"\1", html)
-TCAPS = [
-    "Rangos del AQI (CPCB) que definen las seis clases de AQI_Bucket.",
-    "Variables del conjunto de datos y uso en los modelos.",
-    "Configuración de las cuatro técnicas supervisadas.",
-    "Resultados de los modelos supervisados en los ocho casos (Figura 1 del enunciado).",
-    "Efecto medio de cada decisión de preprocesamiento sobre el F1 macro.",
-    "Recall / F1 por clase en el caso 8.",
-    "Tres datos de prueba, caso 8: clase real y predicción de cada técnica.",
-    "Resultados de K-Means y DBSCAN en los ocho casos (Figura 3 del enunciado).",
-    "Cruce cluster vs clase real de K-Means, caso 8.",
-    "Cruce cluster vs clase real de DBSCAN, caso 8.",
-    "Comparación entre K-Means y DBSCAN.",
-    "Tres datos de prueba, caso 8: cluster asignado por K-Means y DBSCAN.",
-    "Qué técnica sale de qué clase.",
-    "Tres datos de prueba en los ocho casos (supervisado).",
-    "Tres datos de prueba en los ocho casos (no supervisado).",
-]
-_TAB = re.compile(r'<table\b[^>]*\bclass="(?:[^"]*\s)?t(?:\s[^"]*)?"[^>]*>')   # <table class="t ..."> o class="dataframe t ..."
-_n = len(_TAB.findall(html))
-assert _n == len(TCAPS), f"hay {_n} tablas y {len(TCAPS)} pies de tabla: actualiza TCAPS"
-_it = iter(TCAPS)
-html = _TAB.sub(lambda m: f'<div class="tcap">{next(_it)}</div>' + m.group(0), html)
 
-open(f"{D}/informe.html", "w", encoding="utf-8").write(html)
-chrome = next(iter(glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome") + glob.glob("/usr/bin/chromium*") + glob.glob("/usr/bin/google-chrome*")), None)
-if not chrome:
-    sys.exit("No encontré Chromium/Chrome; abran salidas/informe.html y exporten a PDF desde el navegador.")
-subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu", "--no-pdf-header-footer", f"--print-to-pdf={os.path.abspath(OUT_PDF)}",
-                "file://" + os.path.abspath(f"{D}/informe.html")], check=True, capture_output=True)
-print("PDF generado:", OUT_PDF)
+def build_table(spec, width_cm):
+    header, rows, widths, size = spec["header"], spec["rows"], spec["widths"], spec["size"]
+    ncols = sum(c[1] for c in header[0])
+    widths = widths or [width_cm / ncols] * ncols
+    tot = sum(widths)
+    if tot > width_cm + 0.01:
+        widths = [w * width_cm / tot for w in widths]
+    nrows = len(header) + len(rows)
+    t = doc.add_table(rows=nrows, cols=ncols); t.alignment = WD_TABLE_ALIGNMENT.CENTER; t.autofit = False
+    set_cell_margins(t)
+    for ci, w in enumerate(widths):
+        t.columns[ci].width = Cm(w)
+        for ri in range(nrows):
+            t.cell(ri, ci).width = Cm(w)
+    # encabezado con celdas combinadas
+    occupied = [[False] * ncols for _ in header]
+    for ri, hrow in enumerate(header):
+        ci = 0
+        for text, cs, rs in hrow:
+            while ci < ncols and occupied[ri][ci]: ci += 1
+            for dr in range(rs):
+                for dc in range(cs):
+                    if ri + dr < len(header) and ci + dc < ncols: occupied[ri + dr][ci + dc] = True
+            cell = t.cell(ri, ci)
+            if cs > 1 or rs > 1: cell = cell.merge(t.cell(ri + rs - 1, ci + cs - 1))
+            cell.text = ""; par = cell.paragraphs[0]; par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            par.paragraph_format.space_after = Pt(0); par.paragraph_format.line_spacing = 1.0
+            runs(par, text, size, bold=True)
+            set_cell_shade(cell, "D9E2F3")
+            from docx.enum.table import WD_ALIGN_VERTICAL
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            ci += cs
+    for ri, row in enumerate(rows):
+        for ci, text in enumerate(row):
+            cell = t.cell(len(header) + ri, ci); cell.text = ""; par = cell.paragraphs[0]
+            par.paragraph_format.space_after = Pt(0); par.paragraph_format.line_spacing = 1.0
+            par.alignment = WD_ALIGN_PARAGRAPH.LEFT if (ci == 0 and spec["align_first"]) or len(text) > 28 else WD_ALIGN_PARAGRAPH.CENTER
+            runs(par, text, size)
+            if ri % 2 == 1: set_cell_shade(cell, "F2F5FB")
+    # bordes tipo booktabs
+    for ci in range(ncols):
+        set_cell_borders(t.cell(0, ci), top=("single", 12))
+        set_cell_borders(t.cell(len(header) - 1, ci), bottom=("single", 6))
+        set_cell_borders(t.cell(nrows - 1, ci), bottom=("single", 12))
+    for ri in range(nrows):
+        if nrows <= 14 and ri < nrows - 1:
+            for c_ in t.rows[ri].cells:
+                for pp_ in c_.paragraphs: pp_.paragraph_format.keep_with_next = True
+        trPr = t.rows[ri]._tr.get_or_add_trPr(); cs = OxmlElement("w:cantSplit"); trPr.append(cs)
+        if ri < len(header):
+            th = OxmlElement("w:tblHeader"); trPr.append(th)
+    return t
+
+
+sec_n = sub_n = 0
+fig_n = tab_n = 0
+for blk in B:
+    kind = blk[0]
+    if kind == "title":
+        d_ = blk[1]
+        para(d_["titulo"], align=WD_ALIGN_PARAGRAPH.CENTER, size=22, after=6, bold=True).runs[0].bold = True
+        para(d_["subtitulo"], align=WD_ALIGN_PARAGRAPH.CENTER, size=14, after=14, bold=True)
+        para(d_["autores"], align=WD_ALIGN_PARAGRAPH.CENTER, size=12, after=8)
+        for ln in d_["afil"].split("\n"):
+            para(ln, align=WD_ALIGN_PARAGRAPH.CENTER, size=10.5, after=0)
+        doc.add_paragraph().paragraph_format.space_after = Pt(4)
+    elif kind == "abstract":
+        par = para(blk[1], size=10, after=8, indent=1.0); par.paragraph_format.right_indent = Cm(1.0)
+    elif kind == "h1":
+        sec_n += 1; sub_n = 0
+        doc.add_paragraph(f"{sec_n}  {blk[1]}", style="Heading 1")
+    elif kind == "h2":
+        sub_n += 1
+        doc.add_paragraph(f"{sec_n}.{sub_n}  {blk[1]}", style="Heading 2")
+    elif kind == "h1u":
+        doc.add_paragraph(blk[1], style="Heading 1")
+    elif kind == "h2u":
+        h = doc.add_paragraph(style="Heading 2"); runs(h, blk[1], 12.5, bold=True)
+    elif kind == "p":
+        para(blk[1])
+    elif kind == "note":
+        par = para(blk[1], size=10.5, indent=0.6); par.paragraph_format.right_indent = Cm(0.6)
+        pPr = par._p.get_or_add_pPr(); bd = OxmlElement("w:pBdr"); l = OxmlElement("w:left")
+        l.set(qn("w:val"), "single"); l.set(qn("w:sz"), "18"); l.set(qn("w:space"), "6"); l.set(qn("w:color"), "8EA9DB"); bd.append(l); pPr.append(bd)
+    elif kind == "eq":
+        par = para(blk[1], align=WD_ALIGN_PARAGRAPH.CENTER, before=2, after=8)
+        for r in par.runs: r.italic = True
+    elif kind in ("ul", "ol"):
+        for it in blk[1]:
+            par = doc.add_paragraph(style="List Bullet" if kind == "ul" else "List Number"); par.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            runs(par, it)
+    elif kind == "table":
+        tab_n += 1
+        caption(blk[2], "Tabla", tab_n).paragraph_format.keep_with_next = True
+        width = 24.0 if doc.sections[-1].orientation == WD_ORIENT.LANDSCAPE else TEXT_W
+        build_table(blk[3], width)
+        doc.add_paragraph().paragraph_format.space_after = Pt(2)
+    elif kind == "fig":
+        fig_n += 1
+        par = doc.add_paragraph(); par.alignment = WD_ALIGN_PARAGRAPH.CENTER; par.paragraph_format.keep_with_next = True; par.paragraph_format.space_after = Pt(2)
+        fit_pic(par, img(blk[2]), blk[4])
+        caption(blk[3], "Figura", fig_n)
+    elif kind == "figs2":
+        t = doc.add_table(rows=2, cols=len(blk[1])); t.alignment = WD_TABLE_ALIGNMENT.CENTER; t.autofit = False
+        for i, (f_, c_) in enumerate(blk[1]):
+            fig_n += 1
+            cw = TEXT_W / len(blk[1])
+            t.cell(0, i).width = Cm(cw); t.cell(1, i).width = Cm(cw)
+            pp = t.cell(0, i).paragraphs[0]; pp.alignment = WD_ALIGN_PARAGRAPH.CENTER; pp.paragraph_format.space_after = Pt(0)
+            fit_pic(pp, img(f_), cw - 0.3, 9.0)
+            cp = t.cell(1, i).paragraphs[0]; cp.style = st["Caption"]; cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            r = cp.add_run(f"Figura {fig_n}. "); r.bold = True; runs(cp, c_, 9.5)
+        for ri in range(2):
+            trPr = t.rows[ri]._tr.get_or_add_trPr(); trPr.append(OxmlElement("w:cantSplit"))
+        doc.add_paragraph().paragraph_format.space_after = Pt(2)
+    elif kind == "pagebreak":
+        doc.add_page_break()
+    elif kind == "landscape":
+        new = doc.add_section(WD_SECTION.NEW_PAGE)
+        if blk[1]:
+            new.orientation = WD_ORIENT.LANDSCAPE; new.page_width, new.page_height = Cm(27.94), Cm(21.59)
+            new.left_margin = new.right_margin = Cm(1.9); new.top_margin = Cm(2.0); new.bottom_margin = Cm(2.0)
+        else:
+            new.orientation = WD_ORIENT.PORTRAIT; new.page_width, new.page_height = Cm(21.59), Cm(27.94)
+            new.left_margin = new.right_margin = Cm(2.5); new.top_margin = Cm(2.5); new.bottom_margin = Cm(2.3)
+
+
+def campo(par, instr):
+    for typ, txt in (("begin", None), (None, instr), ("end", None)):
+        r = par.add_run()
+        if typ:
+            f = OxmlElement("w:fldChar"); f.set(qn("w:fldCharType"), typ); r._r.append(f)
+        else:
+            it = OxmlElement("w:instrText"); it.set(qn("xml:space"), "preserve"); it.text = txt; r._r.append(it)
+        r.font.size = Pt(9)
+
+
+for s_ in doc.sections:
+    s_.header.is_linked_to_previous = False; s_.footer.is_linked_to_previous = False
+    hp = s_.header.paragraphs[0]; hp.text = ""; hp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    r = hp.add_run("Introducción a la Inteligencia Artificial · Trabajo Práctico 2"); r.font.size = Pt(9); r.italic = True
+    fp = s_.footer.paragraphs[0]; fp.text = ""; fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    campo(fp, "PAGE")
+
+doc.save(OUT_DOCX)
+print("Informe generado:", OUT_DOCX)
+if AVISOS:
+    print("REVISAR TEXTO: las siguientes afirmaciones del informe ya no coinciden con los datos:")
+    for a in AVISOS: print("  -", a)
+else:
+    print("VERIFICACIÓN: todas las afirmaciones cualitativas del texto coinciden con los datos.")
+if "--pdf" in sys.argv:
+    exe = shutil.which("soffice") or shutil.which("libreoffice")
+    if exe:
+        subprocess.run([exe, "--headless", "--convert-to", "pdf", "--outdir", os.path.dirname(OUT_DOCX), OUT_DOCX], check=True, capture_output=True)
+        print("PDF generado junto al .docx")
+    else:
+        print("LibreOffice no está instalado: exporte el PDF desde Word o Google Docs.")
+shutil.rmtree(WORK, ignore_errors=True)
